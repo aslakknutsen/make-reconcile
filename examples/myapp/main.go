@@ -41,9 +41,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Watch our primary resource and a dependency.
+	// Watch our primary resource and dependencies.
 	apps := mr.Watch[*MyApp](mgr)
 	configMaps := mr.Watch[*corev1.ConfigMap](mgr)
+	deployments := mr.Watch[*appsv1.Deployment](mgr)
 
 	// Sub-reconciler: MyApp -> Deployment
 	mr.Reconcile(mgr, apps, func(hc *mr.HandlerContext, app *MyApp) *appsv1.Deployment {
@@ -134,6 +135,17 @@ func main() {
 				},
 			},
 		}
+	})
+
+	// Status reconciler: computes MyApp.status from the app Deployment's readiness.
+	// Runs after output reconcilers. Fetching the Deployment creates a dependency,
+	// so when the Deployment's status changes, the status reconciler re-runs.
+	mr.ReconcileStatus(mgr, apps, func(hc *mr.HandlerContext, app *MyApp) *MyAppStatus {
+		deploy := mr.Fetch(hc, deployments, mr.FilterName(app.Name, app.Namespace))
+		if deploy != nil && deploy.Status.ReadyReplicas >= app.Spec.Replicas {
+			return &MyAppStatus{Ready: true}
+		}
+		return &MyAppStatus{Ready: false}
 	})
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)

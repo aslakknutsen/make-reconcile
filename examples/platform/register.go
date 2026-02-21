@@ -1,6 +1,7 @@
 package main
 
 import (
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 
 	mr "github.com/aslakknutsen/make-reconcile"
@@ -13,6 +14,7 @@ func RegisterAll(mgr *mr.Manager) {
 	platforms := mr.Watch[*Platform](mgr)
 	secrets := mr.Watch[*corev1.Secret](mgr)
 	configMaps := mr.Watch[*corev1.ConfigMap](mgr)
+	deployments := mr.Watch[*appsv1.Deployment](mgr)
 
 	RegisterServiceAccount(mgr, platforms)
 	RegisterConfig(mgr, platforms, secrets)
@@ -24,4 +26,6 @@ func RegisterAll(mgr *mr.Manager) {
 	RegisterMonitoring(mgr, platforms)
 	RegisterNetworkPolicy(mgr, platforms)
 	RegisterWorkers(mgr, platforms)
+
+	RegisterStatus(mgr, platforms, deployments)
 }

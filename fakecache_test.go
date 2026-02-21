@@ -57,6 +57,7 @@ func (f *fakeCache) IndexField(ctx context.Context, obj client.Object, field str
 // fakeClient implements client.Client with no-op writes for testing.
 type fakeClient struct {
 	client.Client
+	statusPatches int
 }
 
 func (f *fakeClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
@@ -64,5 +65,30 @@ func (f *fakeClient) Patch(ctx context.Context, obj client.Object, patch client.
 }
 
 func (f *fakeClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	return nil
+}
+
+func (f *fakeClient) Status() client.SubResourceWriter {
+	return &fakeStatusWriter{fc: f}
+}
+
+type fakeStatusWriter struct {
+	fc *fakeClient
+}
+
+func (f *fakeStatusWriter) Create(ctx context.Context, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
+	return nil
+}
+
+func (f *fakeStatusWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	return nil
+}
+
+func (f *fakeStatusWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	f.fc.statusPatches++
+	return nil
+}
+
+func (f *fakeStatusWriter) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
 	return nil
 }

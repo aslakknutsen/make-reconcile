@@ -290,6 +290,208 @@ func TestRunSubReconcilerTracksOutputDeps(t *testing.T) {
 	}
 }
 
+func TestReconcileStatusRegistration(t *testing.T) {
+	s := coreScheme()
+	mgr := &Manager{
+		scheme:      s,
+		watchedGVKs: make(map[schema.GroupVersionKind]bool),
+		tracker:     newDependencyTracker(),
+		lastOutputs: make(map[string]map[types.NamespacedName]bool),
+	}
+
+	configMaps := Watch[*corev1.ConfigMap](mgr)
+
+	type cmStatus struct {
+		Ready bool `json:"ready"`
+	}
+	ReconcileStatus(mgr, configMaps, func(hc *HandlerContext, cm *corev1.ConfigMap) *cmStatus {
+		return &cmStatus{Ready: true}
+	})
+
+	if len(mgr.statusReconcilers) != 1 {
+		t.Fatalf("expected 1 status reconciler, got %d", len(mgr.statusReconcilers))
+	}
+	sr := mgr.statusReconcilers[0]
+	if sr.ID() != "ConfigMap.status" {
+		t.Errorf("unexpected status reconciler ID: %s", sr.ID())
+	}
+	cmGVK := schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"}
+	if sr.PrimaryGVK() != cmGVK {
+		t.Errorf("unexpected primary GVK: %v", sr.PrimaryGVK())
+	}
+}
+
+func TestReconcileStatusInvocation(t *testing.T) {
+	s := coreScheme()
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-cm-deploy",
+			Namespace: "default",
+		},
+		Status: appsv1.DeploymentStatus{ReadyReplicas: 3},
+	}
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default"},
+	}
+	fc := &fakeCache{
+		objects: map[types.NamespacedName]runtime.Object{
+			{Name: "my-cm", Namespace: "default"}:        cm,
+			{Name: "my-cm-deploy", Namespace: "default"}: deploy,
+		},
+	}
+	fakeC := &fakeClient{}
+	mgr := &Manager{
+		scheme:      s,
+		cache:       fc,
+		client:      fakeC,
+		log:         slog.Default(),
+		watchedGVKs: make(map[schema.GroupVersionKind]bool),
+		tracker:     newDependencyTracker(),
+		lastOutputs: make(map[string]map[types.NamespacedName]bool),
+	}
+
+	configMaps := Watch[*corev1.ConfigMap](mgr)
+	deployments := Watch[*appsv1.Deployment](mgr)
+
+	var gotReady int32
+	type cmStatus struct {
+		ReadyReplicas int32 `json:"readyReplicas"`
+	}
+	ReconcileStatus(mgr, configMaps, func(hc *HandlerContext, cm *corev1.ConfigMap) *cmStatus {
+		dep := Fetch(hc, deployments, FilterName(cm.Name+"-deploy", cm.Namespace))
+		if dep != nil {
+			gotReady = dep.Status.ReadyReplicas
+			return &cmStatus{ReadyReplicas: dep.Status.ReadyReplicas}
+		}
+		return &cmStatus{}
+	})
+
+	sr := mgr.statusReconcilers[0]
+	err := sr.ReconcileStatus(context.Background(), mgr, types.NamespacedName{Name: "my-cm", Namespace: "default"})
+	if err != nil {
+		t.Fatalf("status reconcile error: %v", err)
+	}
+	if gotReady != 3 {
+		t.Errorf("expected Fetch to return deploy with 3 ready replicas, got %d", gotReady)
+	}
+	if fakeC.statusPatches != 1 {
+		t.Errorf("expected 1 status patch call, got %d", fakeC.statusPatches)
+	}
+
+	// Verify dependency was tracked: changing the deployment should re-trigger.
+	deployGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
+	refs := mgr.tracker.Lookup(deployGVK, types.NamespacedName{Name: "my-cm-deploy", Namespace: "default"})
+	if len(refs) != 1 {
+		t.Fatalf("expected 1 tracker ref for deployment dependency, got %d", len(refs))
+	}
+	if refs[0].ReconcilerID != "ConfigMap.status" {
+		t.Errorf("unexpected reconciler ID: %s", refs[0].ReconcilerID)
+	}
+}
+
+func TestReconcileStatusNilSkipsWrite(t *testing.T) {
+	s := coreScheme()
+	fc := &fakeCache{
+		objects: map[types.NamespacedName]runtime.Object{
+			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default"},
+			},
+		},
+	}
+	fakeC := &fakeClient{}
+	mgr := &Manager{
+		scheme:      s,
+		cache:       fc,
+		client:      fakeC,
+		log:         slog.Default(),
+		watchedGVKs: make(map[schema.GroupVersionKind]bool),
+		tracker:     newDependencyTracker(),
+		lastOutputs: make(map[string]map[types.NamespacedName]bool),
+	}
+
+	configMaps := Watch[*corev1.ConfigMap](mgr)
+
+	type cmStatus struct {
+		Ready bool `json:"ready"`
+	}
+	ReconcileStatus(mgr, configMaps, func(hc *HandlerContext, cm *corev1.ConfigMap) *cmStatus {
+		return nil
+	})
+
+	sr := mgr.statusReconcilers[0]
+	err := sr.ReconcileStatus(context.Background(), mgr, types.NamespacedName{Name: "my-cm", Namespace: "default"})
+	if err != nil {
+		t.Fatalf("status reconcile error: %v", err)
+	}
+	if fakeC.statusPatches != 0 {
+		t.Errorf("expected 0 status patches for nil return, got %d", fakeC.statusPatches)
+	}
+}
+
+func TestStatusRunsAfterOutputs(t *testing.T) {
+	s := coreScheme()
+	fc := &fakeCache{
+		objects: map[types.NamespacedName]runtime.Object{
+			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "my-cm",
+					Namespace: "default",
+					UID:       "cm-uid-1",
+				},
+			},
+		},
+	}
+	fakeC := &fakeClient{}
+	mgr := &Manager{
+		scheme:      s,
+		cache:       fc,
+		client:      fakeC,
+		log:         slog.Default(),
+		watchedGVKs: make(map[schema.GroupVersionKind]bool),
+		tracker:     newDependencyTracker(),
+		lastOutputs: make(map[string]map[types.NamespacedName]bool),
+	}
+
+	configMaps := Watch[*corev1.ConfigMap](mgr)
+
+	var order []string
+
+	Reconcile(mgr, configMaps, func(hc *HandlerContext, cm *corev1.ConfigMap) *appsv1.Deployment {
+		order = append(order, "output")
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      cm.Name + "-deploy",
+				Namespace: cm.Namespace,
+			},
+		}
+	})
+
+	type cmStatus struct {
+		Ready bool `json:"ready"`
+	}
+	ReconcileStatus(mgr, configMaps, func(hc *HandlerContext, cm *corev1.ConfigMap) *cmStatus {
+		order = append(order, "status")
+		return &cmStatus{Ready: true}
+	})
+
+	// Simulate what handle() does: trigger via a ConfigMap event.
+	cmGVK := schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"}
+	handler := &eventHandler{mgr: mgr, gvk: cmGVK}
+	handler.handle(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default"},
+	})
+
+	if len(order) < 2 {
+		t.Fatalf("expected at least 2 invocations, got %d", len(order))
+	}
+	if order[0] != "output" {
+		t.Errorf("expected output reconciler to run first, got %q", order[0])
+	}
+	if order[len(order)-1] != "status" {
+		t.Errorf("expected status reconciler to run last, got %q", order[len(order)-1])
+	}
+}
+
 func TestReconcileManyRegistration(t *testing.T) {
 	s := coreScheme()
 	mgr := &Manager{

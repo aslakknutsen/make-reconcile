@@ -103,6 +103,22 @@ mr.Reconcile(mgr, apps, func(hc *mr.HandlerContext, app *MyApp) *appsv1.Deployme
 })
 ```
 
+### ReconcileStatus
+
+`ReconcileStatus[P, S](mgr, primary, fn)` registers a status reconciler. The function receives the primary resource and returns a status struct `*S`. The framework JSON-marshals it and patches the primary's `.status` subresource via server-side apply. Return `nil` to skip the status write.
+
+Status reconcilers run **after** all output reconcilers for the same primary, so Fetch calls on output resources reflect the latest applied state (subject to informer lag).
+
+```go
+mr.ReconcileStatus(mgr, apps, func(hc *mr.HandlerContext, app *MyApp) *MyAppStatus {
+    deploy := mr.Fetch(hc, deployments, mr.FilterName(app.Name, app.Namespace))
+    if deploy != nil && deploy.Status.ReadyReplicas >= app.Spec.Replicas {
+        return &MyAppStatus{Ready: true}
+    }
+    return &MyAppStatus{Ready: false}
+})
+```
+
 ### Full Resync
 
 A periodic full reconcile walks all primary resources and re-runs all sub-reconcilers regardless of events. This is the safety net — if an event is missed, the full resync catches drift. Configurable via `WithResyncPeriod()`.
@@ -136,6 +152,9 @@ mr.Reconcile[P, T](mgr, primaryCollection, func(hc *mr.HandlerContext, p P) T { 
 // Register a 1:N sub-reconciler.
 mr.ReconcileMany[P, T](mgr, primaryCollection, func(hc *mr.HandlerContext, p P) []T { ... })
 
+// Register a status reconciler (runs after output reconcilers).
+mr.ReconcileStatus[P, S](mgr, primaryCollection, func(hc *mr.HandlerContext, p P) *S { ... })
+
 // Inside a sub-reconciler: fetch a single dependency.
 obj := mr.Fetch[T](hc, collection, mr.FilterName("name", "namespace"))
 
@@ -155,7 +174,7 @@ mgr.Start(ctx)
 
 These are tracked directions for the project. Contributions welcome.
 
-- **Status sub-reconcilers**: sub-reconcilers that compute status fields from observed sub-resource state, writing back to the primary resource's status subresource
+- **Foreign resource status** (e.g. Gateway API policy attachment): write status entries to resources you don't own, with field-manager-scoped SSA and finalizer-based cleanup
 - **Conditional watches**: only start informers for GVKs when a feature is enabled in the CR, reducing memory/API load for optional components
 - **Dry-run mode**: return the planned mutations without applying, useful for debugging, testing, and CI validation
 - **Metrics and tracing**: OpenTelemetry integration per sub-reconciler — latency, re-run count, apply count, dependency graph size

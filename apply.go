@@ -2,9 +2,11 @@ package makereconcile
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -75,6 +77,38 @@ func setOwnerRef(obj client.Object, ownerGVK schema.GroupVersionKind, ownerRef t
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// applyStatus patches the primary resource's status subresource via SSA.
+// The status value is JSON-marshaled into the .status field of an unstructured
+// object, then applied with the framework's field manager.
+func applyStatus(ctx context.Context, c client.Client, gvk schema.GroupVersionKind, nn types.NamespacedName, status any) error {
+	statusBytes, err := json.Marshal(status)
+	if err != nil {
+		return fmt.Errorf("marshal status: %w", err)
+	}
+	var statusMap map[string]interface{}
+	if err := json.Unmarshal(statusBytes, &statusMap); err != nil {
+		return fmt.Errorf("unmarshal status to map: %w", err)
+	}
+
+	apiVersion, kind := gvk.ToAPIVersionAndKind()
+	obj := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": apiVersion,
+			"kind":       kind,
+			"metadata": map[string]interface{}{
+				"name":      nn.Name,
+				"namespace": nn.Namespace,
+			},
+			"status": statusMap,
+		},
+	}
+
+	return c.Status().Patch(ctx, obj, client.Apply,
+		client.ForceOwnership,
+		client.FieldOwner(fieldManager),
+	)
+}
 
 func isNotFound(err error) bool {
 	// apimachinery errors implement StatusError with a reason.
