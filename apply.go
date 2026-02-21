@@ -1,0 +1,88 @@
+package makereconcile
+
+import (
+	"context"
+	"fmt"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+const fieldManager = "make-reconcile"
+
+// applyDesired uses server-side apply to create or update the desired resource.
+// It automatically sets ownerReferences pointing to the primary resource.
+func applyDesired(ctx context.Context, c client.Client, desired client.Object, ownerGVK schema.GroupVersionKind, ownerRef types.NamespacedName, ownerUID types.UID) error {
+	setOwnerRef(desired, ownerGVK, ownerRef, ownerUID)
+
+	// Server-side apply: the server handles the merge. We just declare our desired state.
+	opts := []client.PatchOption{
+		client.ForceOwnership,
+		client.FieldOwner(fieldManager),
+	}
+	return c.Patch(ctx, desired, client.Apply, opts...)
+}
+
+// deleteIfExists deletes the resource identified by gvk+name if it exists.
+func deleteIfExists(ctx context.Context, c client.Client, scheme *runtime.Scheme, gvk schema.GroupVersionKind, nn types.NamespacedName) error {
+	obj, err := scheme.New(gvk)
+	if err != nil {
+		return fmt.Errorf("unknown GVK %v: %w", gvk, err)
+	}
+	cObj, ok := obj.(client.Object)
+	if !ok {
+		return fmt.Errorf("type for %v does not implement client.Object", gvk)
+	}
+	cObj.SetName(nn.Name)
+	cObj.SetNamespace(nn.Namespace)
+
+	err = c.Delete(ctx, cObj)
+	if err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func setOwnerRef(obj client.Object, ownerGVK schema.GroupVersionKind, ownerRef types.NamespacedName, ownerUID types.UID) {
+	if ownerUID == "" {
+		return
+	}
+	apiVersion, kind := ownerGVK.ToAPIVersionAndKind()
+	isController := true
+	refs := obj.GetOwnerReferences()
+	for i, ref := range refs {
+		if ref.UID == ownerUID {
+			refs[i].Controller = &isController
+			obj.SetOwnerReferences(refs)
+			return
+		}
+	}
+	refs = append(refs, metav1.OwnerReference{
+		APIVersion:         apiVersion,
+		Kind:               kind,
+		Name:               ownerRef.Name,
+		UID:                ownerUID,
+		Controller:         &isController,
+		BlockOwnerDeletion: boolPtr(true),
+	})
+	obj.SetOwnerReferences(refs)
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+func isNotFound(err error) bool {
+	// apimachinery errors implement StatusError with a reason.
+	type statusErr interface {
+		Status() metav1.Status
+	}
+	if se, ok := err.(statusErr); ok {
+		return se.Status().Reason == metav1.StatusReasonNotFound
+	}
+	return false
+}
