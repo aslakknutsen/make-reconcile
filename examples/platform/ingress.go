@@ -8,18 +8,17 @@ import (
 	mr "github.com/aslakknutsen/make-reconcile"
 )
 
-// RegisterIngress registers a sub-reconciler for the Ingress resource.
+// IngressReconciler returns a handler that produces an Ingress resource.
 // Returns nil when ingress is disabled. Fetches the TLS Secret so the
 // Ingress is re-reconciled if the certificate rotates.
-func RegisterIngress(mgr *mr.Manager, platforms *mr.Collection[*Platform], secrets *mr.Collection[*corev1.Secret]) {
-	mr.Reconcile(mgr, platforms, func(hc *mr.HandlerContext, p *Platform) *networkingv1.Ingress {
+func IngressReconciler(secrets *mr.Collection[*corev1.Secret]) func(*mr.HandlerContext, *Platform) *networkingv1.Ingress {
+	return func(hc *mr.HandlerContext, p *Platform) *networkingv1.Ingress {
 		if !p.Spec.Ingress.Enabled {
 			return nil
 		}
 
 		labels := componentLabels(p.Name, "ingress")
 
-		// Fetch the TLS secret so we re-reconcile when the cert changes.
 		if p.Spec.Ingress.TLSSecretRef != "" {
 			_ = mr.Fetch(hc, secrets, mr.FilterName(p.Spec.Ingress.TLSSecretRef, p.Namespace))
 		}
@@ -57,5 +56,5 @@ func RegisterIngress(mgr *mr.Manager, platforms *mr.Collection[*Platform], secre
 		}
 
 		return ing
-	})
+	}
 }

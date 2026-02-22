@@ -8,16 +8,10 @@ import (
 	mr "github.com/aslakknutsen/make-reconcile"
 )
 
-// RegisterStatus registers a status reconciler that aggregates the health of
-// all sub-resources into the Platform's .status. It Fetches the key Deployments
-// and StatefulSets to check their ready replica counts, then reports an overall
-// Ready/Components/Message on the Platform status.
-func RegisterStatus(
-	mgr *mr.Manager,
-	platforms *mr.Collection[*Platform],
-	deployments *mr.Collection[*appsv1.Deployment],
-) {
-	mr.ReconcileStatus(mgr, platforms, func(hc *mr.HandlerContext, p *Platform) *PlatformStatus {
+// StatusReconciler returns a handler that aggregates the health of all
+// sub-resources into the Platform's .status by Fetching key Deployments.
+func StatusReconciler(deployments *mr.Collection[*appsv1.Deployment]) func(*mr.HandlerContext, *Platform) *PlatformStatus {
+	return func(hc *mr.HandlerContext, p *Platform) *PlatformStatus {
 		var ready, total int
 
 		appDeploy := mr.Fetch(hc, deployments, mr.FilterName(p.Name+"-app", p.Namespace))
@@ -30,14 +24,6 @@ func RegisterStatus(
 		total++
 		if dbDeploy != nil && dbDeploy.Status.ReadyReplicas > 0 {
 			ready++
-		}
-
-		if p.Spec.Cache.Enabled {
-			cacheDeploy := mr.Fetch(hc, deployments, mr.FilterName(p.Name+"-cache", p.Namespace))
-			total++
-			if cacheDeploy != nil && cacheDeploy.Status.ReadyReplicas > 0 {
-				ready++
-			}
 		}
 
 		if p.Spec.Monitoring.Enabled {
@@ -61,5 +47,5 @@ func RegisterStatus(
 			Components: total,
 			Message:    fmt.Sprintf("%d/%d components ready", ready, total),
 		}
-	})
+	}
 }

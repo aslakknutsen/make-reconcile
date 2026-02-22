@@ -12,25 +12,18 @@ import (
 	mr "github.com/aslakknutsen/make-reconcile"
 )
 
-// RegisterMonitoring registers sub-reconcilers for the monitoring stack.
-// Uses FetchAll to discover all Services in the namespace and build a
-// Prometheus scrape config. Returns nil when monitoring is disabled.
-func RegisterMonitoring(mgr *mr.Manager, platforms *mr.Collection[*Platform]) {
-	services := mr.Watch[*corev1.Service](mgr)
-
-	// Monitoring ConfigMap with auto-discovered scrape targets
-	mr.Reconcile(mgr, platforms, func(hc *mr.HandlerContext, p *Platform) *corev1.ConfigMap {
+// MonitoringConfigMapReconciler returns a handler that uses FetchAll to discover
+// all Services in the namespace and build a Prometheus scrape config.
+func MonitoringConfigMapReconciler(services *mr.Collection[*corev1.Service]) func(*mr.HandlerContext, *Platform) *corev1.ConfigMap {
+	return func(hc *mr.HandlerContext, p *Platform) *corev1.ConfigMap {
 		if !p.Spec.Monitoring.Enabled {
 			return nil
 		}
 
-		// FetchAll services in our namespace — broad dependency.
-		// Any Service change in this namespace re-triggers this reconciler.
 		svcs := mr.FetchAll(hc, services, mr.FilterNamespace(p.Namespace))
 
 		var targets []string
 		for _, svc := range svcs {
-			// Only scrape services belonging to this platform.
 			if svc.Labels[LabelName] == p.Name {
 				for _, port := range svc.Spec.Ports {
 					targets = append(targets, fmt.Sprintf("%s.%s:%d", svc.Name, p.Namespace, port.Port))
@@ -46,72 +39,70 @@ func RegisterMonitoring(mgr *mr.Manager, platforms *mr.Collection[*Platform]) {
 				"prometheus.yml": buildPrometheusConfig(targets),
 			},
 		}
-	})
+	}
+}
 
-	// Monitoring Deployment
-	mr.Reconcile(mgr, platforms, func(hc *mr.HandlerContext, p *Platform) *appsv1.Deployment {
-		if !p.Spec.Monitoring.Enabled {
-			return nil
-		}
+func MonitoringDeploymentReconciler(hc *mr.HandlerContext, p *Platform) *appsv1.Deployment {
+	if !p.Spec.Monitoring.Enabled {
+		return nil
+	}
 
-		labels := componentLabels(p.Name, "monitoring")
-		sel := selectorLabels(p.Name, "monitoring")
+	labels := componentLabels(p.Name, "monitoring")
+	sel := selectorLabels(p.Name, "monitoring")
 
-		var one int32 = 1
-		return &appsv1.Deployment{
-			TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
-			ObjectMeta: metav1.ObjectMeta{Name: p.Name + "-monitoring", Namespace: p.Namespace, Labels: labels},
-			Spec: appsv1.DeploymentSpec{
-				Replicas: &one,
-				Selector: &metav1.LabelSelector{MatchLabels: sel},
-				Template: corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{Labels: sel},
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{{
-							Name:  "prometheus",
-							Image: p.Spec.Monitoring.Image,
-							Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: 9090}},
-							VolumeMounts: []corev1.VolumeMount{{
-								Name:      "config",
-								MountPath: "/etc/prometheus",
-							}},
+	var one int32 = 1
+	return &appsv1.Deployment{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
+		ObjectMeta: metav1.ObjectMeta{Name: p.Name + "-monitoring", Namespace: p.Namespace, Labels: labels},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &one,
+			Selector: &metav1.LabelSelector{MatchLabels: sel},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: sel},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name:  "prometheus",
+						Image: p.Spec.Monitoring.Image,
+						Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: 9090}},
+						VolumeMounts: []corev1.VolumeMount{{
+							Name:      "config",
+							MountPath: "/etc/prometheus",
 						}},
-						Volumes: []corev1.Volume{{
-							Name: "config",
-							VolumeSource: corev1.VolumeSource{
-								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{Name: p.Name + "-prometheus"},
-								},
+					}},
+					Volumes: []corev1.Volume{{
+						Name: "config",
+						VolumeSource: corev1.VolumeSource{
+							ConfigMap: &corev1.ConfigMapVolumeSource{
+								LocalObjectReference: corev1.LocalObjectReference{Name: p.Name + "-prometheus"},
 							},
-						}},
-					},
+						},
+					}},
 				},
 			},
-		}
-	})
+		},
+	}
+}
 
-	// Monitoring Service
-	mr.Reconcile(mgr, platforms, func(hc *mr.HandlerContext, p *Platform) *corev1.Service {
-		if !p.Spec.Monitoring.Enabled {
-			return nil
-		}
+func MonitoringServiceReconciler(hc *mr.HandlerContext, p *Platform) *corev1.Service {
+	if !p.Spec.Monitoring.Enabled {
+		return nil
+	}
 
-		labels := componentLabels(p.Name, "monitoring")
-		sel := selectorLabels(p.Name, "monitoring")
+	labels := componentLabels(p.Name, "monitoring")
+	sel := selectorLabels(p.Name, "monitoring")
 
-		return &corev1.Service{
-			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
-			ObjectMeta: metav1.ObjectMeta{Name: p.Name + "-monitoring", Namespace: p.Namespace, Labels: labels},
-			Spec: corev1.ServiceSpec{
-				Selector: sel,
-				Ports: []corev1.ServicePort{{
-					Name:       "http",
-					Port:       9090,
-					TargetPort: intstr.FromString("http"),
-				}},
-			},
-		}
-	})
+	return &corev1.Service{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
+		ObjectMeta: metav1.ObjectMeta{Name: p.Name + "-monitoring", Namespace: p.Namespace, Labels: labels},
+		Spec: corev1.ServiceSpec{
+			Selector: sel,
+			Ports: []corev1.ServicePort{{
+				Name:       "http",
+				Port:       9090,
+				TargetPort: intstr.FromString("http"),
+			}},
+		},
+	}
 }
 
 func buildPrometheusConfig(targets []string) string {

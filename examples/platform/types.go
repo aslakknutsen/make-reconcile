@@ -23,7 +23,6 @@ type Platform struct {
 type PlatformSpec struct {
 	App         AppSpec         `json:"app"`
 	Database    DatabaseSpec    `json:"database"`
-	Cache       CacheSpec       `json:"cache,omitempty"`
 	Ingress     IngressSpec     `json:"ingress,omitempty"`
 	Autoscaling AutoscalingSpec `json:"autoscaling,omitempty"`
 	Monitoring  MonitoringSpec  `json:"monitoring,omitempty"`
@@ -40,12 +39,6 @@ type DatabaseSpec struct {
 	Image       string `json:"image"`
 	StorageSize string `json:"storageSize"`
 	Port        int32  `json:"port"`
-}
-
-type CacheSpec struct {
-	Enabled bool   `json:"enabled"`
-	Image   string `json:"image,omitempty"`
-	Port    int32  `json:"port,omitempty"`
 }
 
 type IngressSpec struct {
