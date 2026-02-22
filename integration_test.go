@@ -8,6 +8,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -27,6 +28,7 @@ func TestReconcileRegistration(t *testing.T) {
 		scheme:      s,
 		watchedGVKs: make(map[schema.GroupVersionKind]bool),
 		tracker:     newDependencyTracker(),
+		managerID:   "default",
 		lastOutputs: make(map[string]map[types.NamespacedName]bool),
 	}
 
@@ -159,6 +161,7 @@ func TestSubReconcilerNilMeansDelete(t *testing.T) {
 		cache:       fc,
 		watchedGVKs: make(map[schema.GroupVersionKind]bool),
 		tracker:     newDependencyTracker(),
+		managerID:   "default",
 		lastOutputs: make(map[string]map[types.NamespacedName]bool),
 	}
 
@@ -198,6 +201,7 @@ func TestFetchTracksDependency(t *testing.T) {
 		cache:       fc,
 		watchedGVKs: make(map[schema.GroupVersionKind]bool),
 		tracker:     newDependencyTracker(),
+		managerID:   "default",
 		lastOutputs: make(map[string]map[types.NamespacedName]bool),
 	}
 
@@ -257,6 +261,7 @@ func TestRunSubReconcilerTracksOutputDeps(t *testing.T) {
 		log:         slog.Default(),
 		watchedGVKs: make(map[schema.GroupVersionKind]bool),
 		tracker:     newDependencyTracker(),
+		managerID:   "default",
 		lastOutputs: make(map[string]map[types.NamespacedName]bool),
 	}
 
@@ -296,6 +301,7 @@ func TestReconcileStatusRegistration(t *testing.T) {
 		scheme:      s,
 		watchedGVKs: make(map[schema.GroupVersionKind]bool),
 		tracker:     newDependencyTracker(),
+		managerID:   "default",
 		lastOutputs: make(map[string]map[types.NamespacedName]bool),
 	}
 
@@ -347,6 +353,7 @@ func TestReconcileStatusInvocation(t *testing.T) {
 		log:         slog.Default(),
 		watchedGVKs: make(map[schema.GroupVersionKind]bool),
 		tracker:     newDependencyTracker(),
+		managerID:   "default",
 		lastOutputs: make(map[string]map[types.NamespacedName]bool),
 	}
 
@@ -406,6 +413,7 @@ func TestReconcileStatusNilSkipsWrite(t *testing.T) {
 		log:         slog.Default(),
 		watchedGVKs: make(map[schema.GroupVersionKind]bool),
 		tracker:     newDependencyTracker(),
+		managerID:   "default",
 		lastOutputs: make(map[string]map[types.NamespacedName]bool),
 	}
 
@@ -449,6 +457,7 @@ func TestStatusRunsAfterOutputs(t *testing.T) {
 		log:         slog.Default(),
 		watchedGVKs: make(map[schema.GroupVersionKind]bool),
 		tracker:     newDependencyTracker(),
+		managerID:   "default",
 		lastOutputs: make(map[string]map[types.NamespacedName]bool),
 	}
 
@@ -498,6 +507,7 @@ func TestReconcileManyRegistration(t *testing.T) {
 		scheme:      s,
 		watchedGVKs: make(map[schema.GroupVersionKind]bool),
 		tracker:     newDependencyTracker(),
+		managerID:   "default",
 		lastOutputs: make(map[string]map[types.NamespacedName]bool),
 	}
 
@@ -532,5 +542,136 @@ func TestReconcileManyRegistration(t *testing.T) {
 	}
 	if len(desired) != 2 {
 		t.Fatalf("expected 2 desired objects, got %d", len(desired))
+	}
+}
+
+func TestGCOrphansDeletesUnclaimedResources(t *testing.T) {
+	s := coreScheme()
+	deployGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
+
+	fakeC := &fakeClient{
+		listObjects: map[schema.GroupVersionKind][]unstructured.Unstructured{
+			deployGVK: {
+				makeUnstructured(deployGVK, "wanted-deploy", "default", "test-mgr"),
+				makeUnstructured(deployGVK, "orphan-deploy", "default", "test-mgr"),
+			},
+		},
+	}
+
+	mgr := &Manager{
+		scheme:      s,
+		client:      fakeC,
+		log:         slog.Default(),
+		watchedGVKs: make(map[schema.GroupVersionKind]bool),
+		tracker:     newDependencyTracker(),
+		managerID:   "test-mgr",
+		lastOutputs: map[string]map[types.NamespacedName]bool{
+			"ConfigMap->Deployment/default/my-cm": {
+				{Name: "wanted-deploy", Namespace: "default"}: true,
+			},
+		},
+	}
+
+	configMaps := Watch[*corev1.ConfigMap](mgr)
+	Reconcile(mgr, configMaps, func(hc *HandlerContext, cm *corev1.ConfigMap) *appsv1.Deployment {
+		return nil
+	})
+
+	mgr.gcOrphans(context.Background())
+
+	if len(fakeC.deleted) != 1 {
+		t.Fatalf("expected 1 deletion, got %d: %v", len(fakeC.deleted), fakeC.deleted)
+	}
+	if fakeC.deleted[0].Name != "orphan-deploy" {
+		t.Errorf("expected orphan-deploy to be deleted, got %q", fakeC.deleted[0].Name)
+	}
+}
+
+func TestGCOrphansPreservesClaimedResources(t *testing.T) {
+	s := coreScheme()
+	deployGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
+
+	fakeC := &fakeClient{
+		listObjects: map[schema.GroupVersionKind][]unstructured.Unstructured{
+			deployGVK: {
+				makeUnstructured(deployGVK, "my-deploy", "default", "test-mgr"),
+			},
+		},
+	}
+
+	mgr := &Manager{
+		scheme:      s,
+		client:      fakeC,
+		log:         slog.Default(),
+		watchedGVKs: make(map[schema.GroupVersionKind]bool),
+		tracker:     newDependencyTracker(),
+		managerID:   "test-mgr",
+		lastOutputs: map[string]map[types.NamespacedName]bool{
+			"ConfigMap->Deployment/default/my-cm": {
+				{Name: "my-deploy", Namespace: "default"}: true,
+			},
+		},
+	}
+
+	configMaps := Watch[*corev1.ConfigMap](mgr)
+	Reconcile(mgr, configMaps, func(hc *HandlerContext, cm *corev1.ConfigMap) *appsv1.Deployment {
+		return nil
+	})
+
+	mgr.gcOrphans(context.Background())
+
+	if len(fakeC.deleted) != 0 {
+		t.Errorf("expected no deletions, got %d: %v", len(fakeC.deleted), fakeC.deleted)
+	}
+}
+
+func TestGCOrphansManagerIDIsolation(t *testing.T) {
+	s := coreScheme()
+	deployGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
+
+	fakeC := &fakeClient{
+		listObjects: map[schema.GroupVersionKind][]unstructured.Unstructured{
+			deployGVK: {
+				makeUnstructured(deployGVK, "other-deploy", "default", "other-mgr"),
+			},
+		},
+	}
+
+	mgr := &Manager{
+		scheme:      s,
+		client:      fakeC,
+		log:         slog.Default(),
+		watchedGVKs: make(map[schema.GroupVersionKind]bool),
+		tracker:     newDependencyTracker(),
+		managerID:   "my-mgr",
+		lastOutputs: make(map[string]map[types.NamespacedName]bool),
+	}
+
+	configMaps := Watch[*corev1.ConfigMap](mgr)
+	Reconcile(mgr, configMaps, func(hc *HandlerContext, cm *corev1.ConfigMap) *appsv1.Deployment {
+		return nil
+	})
+
+	mgr.gcOrphans(context.Background())
+
+	if len(fakeC.deleted) != 0 {
+		t.Errorf("expected no deletions (different manager ID), got %d: %v", len(fakeC.deleted), fakeC.deleted)
+	}
+}
+
+func makeUnstructured(gvk schema.GroupVersionKind, name, namespace, managerID string) unstructured.Unstructured {
+	apiVersion, kind := gvk.ToAPIVersionAndKind()
+	return unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": apiVersion,
+			"kind":       kind,
+			"metadata": map[string]interface{}{
+				"name":      name,
+				"namespace": namespace,
+				"labels": map[string]interface{}{
+					managedByLabel: managerID,
+				},
+			},
+		},
 	}
 }

@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -55,9 +58,16 @@ func (f *fakeCache) IndexField(ctx context.Context, obj client.Object, field str
 }
 
 // fakeClient implements client.Client with no-op writes for testing.
+// It supports List (for gcOrphans) and tracks Delete calls.
 type fakeClient struct {
 	client.Client
 	statusPatches int
+
+	// listObjects are returned by List, keyed by item GVK (not the "List" GVK).
+	listObjects map[schema.GroupVersionKind][]unstructured.Unstructured
+
+	// deleted records which objects were deleted, for test assertions.
+	deleted []types.NamespacedName
 }
 
 func (f *fakeClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
@@ -65,6 +75,36 @@ func (f *fakeClient) Patch(ctx context.Context, obj client.Object, patch client.
 }
 
 func (f *fakeClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	f.deleted = append(f.deleted, types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()})
+	return nil
+}
+
+func (f *fakeClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	listOpts := &client.ListOptions{}
+	for _, o := range opts {
+		o.ApplyToList(listOpts)
+	}
+
+	uList, ok := list.(*unstructured.UnstructuredList)
+	if !ok {
+		return fmt.Errorf("fakeClient.List only supports UnstructuredList")
+	}
+
+	gvk := uList.GetObjectKind().GroupVersionKind()
+	itemGVK := schema.GroupVersionKind{
+		Group:   gvk.Group,
+		Version: gvk.Version,
+		Kind:    strings.TrimSuffix(gvk.Kind, "List"),
+	}
+
+	var filtered []unstructured.Unstructured
+	for _, obj := range f.listObjects[itemGVK] {
+		if listOpts.LabelSelector != nil && !listOpts.LabelSelector.Matches(labels.Set(obj.GetLabels())) {
+			continue
+		}
+		filtered = append(filtered, obj)
+	}
+	uList.Items = filtered
 	return nil
 }
 

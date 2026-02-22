@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -36,6 +38,7 @@ type Manager struct {
 	tracker           *dependencyTracker
 
 	resyncPeriod time.Duration
+	managerID    string
 
 	// lastOutputs tracks which output resource keys were produced by each
 	// (reconciler, primary) pair on the last run. Used to detect deletions
@@ -54,6 +57,13 @@ func WithResyncPeriod(d time.Duration) ManagerOption {
 // WithLogger sets the logger. Default is slog.Default().
 func WithLogger(l *slog.Logger) ManagerOption {
 	return func(m *Manager) { m.log = l }
+}
+
+// WithManagerID sets the manager identity used to label output resources.
+// This scopes orphan GC so multiple independent managers in the same cluster
+// don't interfere with each other. Default is "default".
+func WithManagerID(id string) ManagerOption {
+	return func(m *Manager) { m.managerID = id }
 }
 
 // NewManager creates a new Manager from a rest.Config and scheme.
@@ -87,6 +97,7 @@ func NewManager(cfg *rest.Config, scheme *runtime.Scheme, opts ...ManagerOption)
 		watchedGVKs:  make(map[schema.GroupVersionKind]bool),
 		tracker:      newDependencyTracker(),
 		resyncPeriod: 5 * time.Minute,
+		managerID:    "default",
 		lastOutputs:  make(map[string]map[types.NamespacedName]bool),
 	}
 	for _, o := range opts {
@@ -105,6 +116,7 @@ func NewManagerForTest(scheme *runtime.Scheme) *Manager {
 		watchedGVKs:  make(map[schema.GroupVersionKind]bool),
 		tracker:      newDependencyTracker(),
 		resyncPeriod: 5 * time.Minute,
+		managerID:    "default",
 		lastOutputs:  make(map[string]map[types.NamespacedName]bool),
 	}
 }
@@ -130,8 +142,9 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 	m.log.Info("cache synced, running initial full reconcile")
 
-	// Initial full reconcile.
+	// Initial full reconcile + orphan GC.
 	m.fullReconcile(ctx)
+	m.gcOrphans(ctx)
 
 	// Periodic full resync.
 	ticker := time.NewTicker(m.resyncPeriod)
@@ -143,6 +156,7 @@ func (m *Manager) Start(ctx context.Context) error {
 		case <-ticker.C:
 			m.log.Info("periodic full reconcile")
 			m.fullReconcile(ctx)
+			m.gcOrphans(ctx)
 		}
 	}
 }
@@ -283,7 +297,7 @@ func (m *Manager) runSubReconciler(ctx context.Context, r subReconciler, primary
 		if primaryObj != nil {
 			uid = primaryObj.GetUID()
 		}
-		if err := applyDesired(ctx, m.client, obj, r.PrimaryGVK(), primaryKey, uid); err != nil {
+		if err := applyDesired(ctx, m.client, obj, r.PrimaryGVK(), primaryKey, uid, m.managerID); err != nil {
 			m.log.Error("apply failed",
 				"reconciler", r.ID(),
 				"resource", onn,
@@ -393,6 +407,56 @@ func (m *Manager) fullReconcile(ctx context.Context) {
 			}
 			nn := types.NamespacedName{Name: cObj.GetName(), Namespace: cObj.GetNamespace()}
 			m.runStatusReconciler(ctx, sr, nn)
+		}
+	}
+}
+
+// gcOrphans deletes output resources that carry the managed-by label for this
+// manager but are not claimed by any sub-reconciler in the current lastOutputs.
+// This catches resources orphaned by a crash+restart when lastOutputs was lost.
+func (m *Manager) gcOrphans(ctx context.Context) {
+	m.mu.Lock()
+
+	// Build wanted set per output GVK from current lastOutputs.
+	wanted := make(map[schema.GroupVersionKind]map[types.NamespacedName]bool)
+	for _, r := range m.reconcilers {
+		gvk := r.OutputGVK()
+		if wanted[gvk] == nil {
+			wanted[gvk] = make(map[types.NamespacedName]bool)
+		}
+		prefix := r.ID() + "/"
+		for outputKey, nns := range m.lastOutputs {
+			if strings.HasPrefix(outputKey, prefix) {
+				for nn := range nns {
+					wanted[gvk][nn] = true
+				}
+			}
+		}
+	}
+
+	m.mu.Unlock()
+
+	for gvk, wantNNs := range wanted {
+		list := &unstructured.UnstructuredList{}
+		list.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   gvk.Group,
+			Version: gvk.Version,
+			Kind:    gvk.Kind + "List",
+		})
+
+		if err := m.client.List(ctx, list, client.MatchingLabels{managedByLabel: m.managerID}); err != nil {
+			m.log.Error("gc orphans list failed", "gvk", gvk, "error", err)
+			continue
+		}
+
+		for _, item := range list.Items {
+			nn := types.NamespacedName{Name: item.GetName(), Namespace: item.GetNamespace()}
+			if !wantNNs[nn] {
+				m.log.Info("deleting orphan resource", "gvk", gvk, "resource", nn)
+				if err := deleteIfExists(ctx, m.client, m.scheme, gvk, nn); err != nil {
+					m.log.Error("gc orphan delete failed", "gvk", gvk, "resource", nn, "error", err)
+				}
+			}
 		}
 	}
 }

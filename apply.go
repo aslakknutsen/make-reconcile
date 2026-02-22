@@ -13,19 +13,32 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-const fieldManager = "make-reconcile"
+const (
+	fieldManager    = "make-reconcile"
+	managedByLabel  = "make-reconcile.io/managed-by"
+)
 
 // applyDesired uses server-side apply to create or update the desired resource.
-// It automatically sets ownerReferences pointing to the primary resource.
-func applyDesired(ctx context.Context, c client.Client, desired client.Object, ownerGVK schema.GroupVersionKind, ownerRef types.NamespacedName, ownerUID types.UID) error {
+// It automatically sets ownerReferences pointing to the primary resource and
+// a managed-by label used for orphan garbage collection.
+func applyDesired(ctx context.Context, c client.Client, desired client.Object, ownerGVK schema.GroupVersionKind, ownerRef types.NamespacedName, ownerUID types.UID, managerID string) error {
 	setOwnerRef(desired, ownerGVK, ownerRef, ownerUID)
+	setManagedByLabel(desired, managerID)
 
-	// Server-side apply: the server handles the merge. We just declare our desired state.
 	opts := []client.PatchOption{
 		client.ForceOwnership,
 		client.FieldOwner(fieldManager),
 	}
 	return c.Patch(ctx, desired, client.Apply, opts...)
+}
+
+func setManagedByLabel(obj client.Object, managerID string) {
+	labels := obj.GetLabels()
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	labels[managedByLabel] = managerID
+	obj.SetLabels(labels)
 }
 
 // deleteIfExists deletes the resource identified by gvk+name if it exists.
