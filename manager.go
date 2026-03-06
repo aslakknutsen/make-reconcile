@@ -47,6 +47,11 @@ type Manager struct {
 	// (reconciler, primary) pair on the last run. Used to detect deletions
 	// when the set of outputs shrinks.
 	lastOutputs map[string]map[types.NamespacedName]bool
+
+	// pendingWatches holds GVKs whose CRDs were not available at startup.
+	// A background goroutine retries registration periodically.
+	pendingWatches             []schema.GroupVersionKind
+	pendingWatchRetryInterval  time.Duration
 }
 
 // ManagerOption configures a Manager.
@@ -67,6 +72,12 @@ func WithLogger(l *slog.Logger) ManagerOption {
 // don't interfere with each other. Default is "default".
 func WithManagerID(id string) ManagerOption {
 	return func(m *Manager) { m.managerID = id }
+}
+
+// WithPendingWatchRetryInterval sets how often the manager retries registering
+// watches for GVKs whose CRDs were not available at startup. Default is 10s.
+func WithPendingWatchRetryInterval(d time.Duration) ManagerOption {
+	return func(m *Manager) { m.pendingWatchRetryInterval = d }
 }
 
 // WithEventRecorder sets the Kubernetes event recorder used to emit events
@@ -136,11 +147,23 @@ func NewManagerForTest(scheme *runtime.Scheme) *Manager {
 
 // Start begins watching all registered GVKs, routing events to sub-reconcilers,
 // and running periodic full resyncs. Blocks until ctx is cancelled.
+//
+// If a watched GVK's CRD is not yet installed on the cluster, Start does not
+// fail. Instead it skips that watch and retries periodically in the background.
+// When the CRD becomes available the handler is registered and a full reconcile
+// runs so that all reconcilers see the newly available resources.
 func (m *Manager) Start(ctx context.Context) error {
 	// Register informer event handlers before starting the cache.
+	// GVKs whose CRD is missing are collected for background retry.
+	var pending []schema.GroupVersionKind
 	for gvk := range m.watchedGVKs {
-		if err := m.registerHandler(ctx, gvk); err != nil {
+		registered, err := m.registerHandler(ctx, gvk)
+		if err != nil {
 			return fmt.Errorf("register handler for %v: %w", gvk, err)
+		}
+		if !registered {
+			m.log.Warn("CRD not found, will retry periodically", "gvk", gvk)
+			pending = append(pending, gvk)
 		}
 	}
 
@@ -159,6 +182,14 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.fullReconcile(ctx)
 	m.gcOrphans(ctx)
 
+	// Start background retry for GVKs whose CRDs were missing at startup.
+	if len(pending) > 0 {
+		m.mu.Lock()
+		m.pendingWatches = pending
+		m.mu.Unlock()
+		go m.retryPendingWatches(ctx)
+	}
+
 	// Periodic full resync.
 	ticker := time.NewTicker(m.resyncPeriod)
 	defer ticker.Stop()
@@ -174,24 +205,95 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 }
 
-func (m *Manager) registerHandler(ctx context.Context, gvk schema.GroupVersionKind) error {
+// PendingWatchCount returns the number of GVKs still awaiting CRD availability.
+func (m *Manager) PendingWatchCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.pendingWatches)
+}
+
+// retryPendingWatches periodically attempts to register event handlers for
+// GVKs whose CRDs were missing at startup. When a CRD becomes available the
+// handler is registered, the cache is synced, and a full reconcile runs.
+// Exits when all pending watches are resolved or the context is cancelled.
+func (m *Manager) retryPendingWatches(ctx context.Context) {
+	interval := m.pendingWatchRetryInterval
+	if interval == 0 {
+		interval = 10 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.mu.Lock()
+			pending := make([]schema.GroupVersionKind, len(m.pendingWatches))
+			copy(pending, m.pendingWatches)
+			m.mu.Unlock()
+
+			if len(pending) == 0 {
+				return
+			}
+
+			var stillPending []schema.GroupVersionKind
+			resolved := false
+			for _, gvk := range pending {
+				registered, err := m.registerHandler(ctx, gvk)
+				if err != nil {
+					m.log.Error("retry register handler failed", "gvk", gvk, "error", err)
+					stillPending = append(stillPending, gvk)
+					continue
+				}
+				if !registered {
+					stillPending = append(stillPending, gvk)
+					continue
+				}
+				m.log.Info("CRD now available, watch registered", "gvk", gvk)
+				resolved = true
+			}
+
+			m.mu.Lock()
+			m.pendingWatches = stillPending
+			m.mu.Unlock()
+
+			if resolved {
+				if !m.cache.WaitForCacheSync(ctx) {
+					m.log.Error("cache sync failed after registering pending watch")
+					continue
+				}
+				m.fullReconcile(ctx)
+			}
+		}
+	}
+}
+
+// registerHandler sets up an informer event handler for the given GVK.
+// Returns (true, nil) on success, (false, nil) when the CRD is not yet
+// installed on the cluster, or (false, err) for other failures.
+func (m *Manager) registerHandler(ctx context.Context, gvk schema.GroupVersionKind) (bool, error) {
 	obj, err := m.scheme.New(gvk)
 	if err != nil {
-		return fmt.Errorf("scheme.New(%v): %w", gvk, err)
+		return false, fmt.Errorf("scheme.New(%v): %w", gvk, err)
 	}
 	cObj, ok := obj.(client.Object)
 	if !ok {
-		return fmt.Errorf("type for %v does not implement client.Object", gvk)
+		return false, fmt.Errorf("type for %v does not implement client.Object", gvk)
 	}
 
 	informer, err := m.cache.GetInformer(ctx, cObj)
 	if err != nil {
-		return fmt.Errorf("get informer for %v: %w", gvk, err)
+		if meta.IsNoMatchError(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get informer for %v: %w", gvk, err)
 	}
 
 	handler := &eventHandler{mgr: m, gvk: gvk, predicates: m.watchPredicates[gvk]}
 	informer.AddEventHandler(handler)
-	return nil
+	return true, nil
 }
 
 // eventHandler routes informer events to the appropriate sub-reconcilers.
