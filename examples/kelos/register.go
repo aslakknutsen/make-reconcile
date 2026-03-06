@@ -4,15 +4,15 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 
 	mr "github.com/aslakknutsen/make-reconcile"
 )
 
 func RegisterAll(mgr *mr.Manager) {
-	// Primary watches
-	tasks := mr.Watch[*Task](mgr)
-	taskSpawners := mr.Watch[*TaskSpawner](mgr)
+	// Primary watches — WithGenerationChanged suppresses status-only updates
+	// so status reconciler writes don't trigger redundant output reconcile cycles.
+	tasks := mr.Watch[*Task](mgr, mr.WithGenerationChanged())
+	taskSpawners := mr.Watch[*TaskSpawner](mgr, mr.WithGenerationChanged())
 
 	// Dependency watches
 	workspaces := mr.Watch[*Workspace](mgr)
@@ -82,9 +82,6 @@ func RegisterAll(mgr *mr.Manager) {
 	// 6. Prometheus metrics: task_created_total, task_duration_seconds, etc.
 	//    No hook point in make-reconcile for emitting metrics.
 	//
-	// 7. Event recording: Kubernetes Events for lifecycle transitions.
-	//    Same gap as identified in gatewayclass and coraza analyses.
-	//
 	// TaskSpawnerReconciler gaps (minor — ~90% maps cleanly):
 	//
 	// 1. Workspace → Secret resolution chain: The original checks if the
@@ -96,12 +93,7 @@ func RegisterAll(mgr *mr.Manager) {
 	//    specs field-by-field. SSA eliminates this entirely — just apply the
 	//    desired state.
 	//
-	// 3. Event recording: Same as above.
-	//
-	// 4. Singleton RBAC: ensureSpawnerRBAC creates namespace-scoped singletons
+	// 3. Singleton RBAC: ensureSpawnerRBAC creates namespace-scoped singletons
 	//    shared across all TaskSpawners. The owner reference problem means
 	//    deleting one TaskSpawner could GC resources needed by others.
 }
-
-// unused prevents "imported and not used" for rbacv1
-var _ = rbacv1.GroupName

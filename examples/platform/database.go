@@ -14,14 +14,29 @@ import (
 	mr "github.com/aslakknutsen/make-reconcile"
 )
 
-func DatabaseSecretReconciler(hc *mr.HandlerContext, p *Platform) *corev1.Secret {
-	return &corev1.Secret{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
-		ObjectMeta: metav1.ObjectMeta{Name: p.Name + "-db", Namespace: p.Namespace, Labels: componentLabels(p.Name, "database")},
-		StringData: map[string]string{
-			"username": "app",
-			"password": generatePassword(),
-		},
+// DatabaseSecretReconciler returns a handler that produces the database
+// credentials Secret. It Fetches the existing Secret first — if it already
+// exists, the reconciler re-applies the same data so SSA is a no-op.
+// Without this, generatePassword() would produce a new password every
+// reconcile, causing perpetual Secret→ConfigMap→Deployment cascades.
+func DatabaseSecretReconciler(secrets *mr.Collection[*corev1.Secret]) func(*mr.HandlerContext, *Platform) *corev1.Secret {
+	return func(hc *mr.HandlerContext, p *Platform) *corev1.Secret {
+		secretName := p.Name + "-db"
+		existing := mr.Fetch(hc, secrets, mr.FilterName(secretName, p.Namespace))
+
+		password := generatePassword()
+		if existing != nil {
+			password = string(existing.Data["password"])
+		}
+
+		return &corev1.Secret{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+			ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: p.Namespace, Labels: componentLabels(p.Name, "database")},
+			StringData: map[string]string{
+				"username": "app",
+				"password": password,
+			},
+		}
 	}
 }
 

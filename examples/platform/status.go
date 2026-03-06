@@ -9,8 +9,12 @@ import (
 )
 
 // StatusReconciler returns a handler that aggregates the health of all
-// sub-resources into the Platform's .status by Fetching key Deployments.
-func StatusReconciler(deployments *mr.Collection[*appsv1.Deployment]) func(*mr.HandlerContext, *Platform) *PlatformStatus {
+// sub-resources into the Platform's .status by Fetching key Deployments
+// and StatefulSets.
+func StatusReconciler(
+	deployments *mr.Collection[*appsv1.Deployment],
+	statefulSets *mr.Collection[*appsv1.StatefulSet],
+) func(*mr.HandlerContext, *Platform) *PlatformStatus {
 	return func(hc *mr.HandlerContext, p *Platform) *PlatformStatus {
 		var ready, total int
 
@@ -20,9 +24,9 @@ func StatusReconciler(deployments *mr.Collection[*appsv1.Deployment]) func(*mr.H
 			ready++
 		}
 
-		dbDeploy := mr.Fetch(hc, deployments, mr.FilterName(p.Name+"-db", p.Namespace))
+		dbSts := mr.Fetch(hc, statefulSets, mr.FilterName(p.Name+"-db", p.Namespace))
 		total++
-		if dbDeploy != nil && dbDeploy.Status.ReadyReplicas > 0 {
+		if dbSts != nil && dbSts.Status.ReadyReplicas > 0 {
 			ready++
 		}
 

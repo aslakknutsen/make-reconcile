@@ -42,7 +42,9 @@ func main() {
 	}
 
 	// Watch our primary resource and dependencies.
-	apps := mr.Watch[*MyApp](mgr)
+	// WithGenerationChanged filters out status-only updates, preventing
+	// the status reconciler from triggering a redundant output reconcile cycle.
+	apps := mr.Watch[*MyApp](mgr, mr.WithGenerationChanged())
 	configMaps := mr.Watch[*corev1.ConfigMap](mgr)
 	deployments := mr.Watch[*appsv1.Deployment](mgr)
 

@@ -5,7 +5,7 @@ import (
 )
 
 func RegisterAll(mgr *mr.Manager) {
-	gatewayClasses := mr.Watch[*GatewayClass](mgr)
+	gatewayClasses := mr.Watch[*GatewayClass](mgr, mr.WithGenerationChanged())
 	istios := mr.Watch[*Istio](mgr)
 
 	isOurGatewayClass := mr.WithPredicate(func(gc *GatewayClass) bool {
@@ -52,7 +52,10 @@ func RegisterAll(mgr *mr.Manager) {
 	//
 	// 5. Dynamic watch creation (sync.Once for Istio CRD):
 	//    The original lazily adds a watch after the CRD is installed.
-	//    make-reconcile requires all watches registered before Start().
+	//    make-reconcile handles this: if the Istio CRD is not installed at
+	//    startup, the watch goes into pendingWatches and retries periodically.
+	//    When the CRD becomes available, the handler is registered and a full
+	//    reconcile runs. No lazy initialization needed.
 	//
 	// 6. Custom event source (SailLibrarySource channel bridge):
 	//    The Sail Library pushes events via a Go channel.

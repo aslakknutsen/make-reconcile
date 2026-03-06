@@ -8,7 +8,7 @@ import (
 )
 
 func RegisterAll(mgr *mr.Manager) {
-	platforms := mr.Watch[*Platform](mgr)
+	platforms := mr.Watch[*Platform](mgr, mr.WithGenerationChanged())
 	secrets := mr.Watch[*corev1.Secret](mgr)
 	configMaps := mr.Watch[*corev1.ConfigMap](mgr)
 	services := mr.Watch[*corev1.Service](mgr)
@@ -19,7 +19,7 @@ func RegisterAll(mgr *mr.Manager) {
 	mr.Reconcile(mgr, platforms, NetworkPolicyReconciler)
 
 	// Config chain: Secret -> ConfigMap -> Deployment
-	mr.Reconcile(mgr, platforms, DatabaseSecretReconciler)
+	mr.Reconcile(mgr, platforms, DatabaseSecretReconciler(secrets))
 	mr.Reconcile(mgr, platforms, ConfigReconciler(secrets))
 	mr.Reconcile(mgr, platforms, AppDeploymentReconciler(configMaps))
 	mr.Reconcile(mgr, platforms, AppServiceReconciler)
@@ -42,5 +42,6 @@ func RegisterAll(mgr *mr.Manager) {
 	mr.ReconcileMany(mgr, platforms, WorkersReconciler)
 
 	// Status (runs after all outputs)
-	mr.ReconcileStatus(mgr, platforms, StatusReconciler(deployments))
+	statefulSets := mr.Watch[*appsv1.StatefulSet](mgr)
+	mr.ReconcileStatus(mgr, platforms, StatusReconciler(deployments, statefulSets))
 }
