@@ -5,70 +5,26 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 )
-
-// fakeEventRecorder captures events for test assertions.
-type fakeEventRecorder struct {
-	mu     sync.Mutex
-	events []recordedEvent
-}
-
-type recordedEvent struct {
-	ObjectName string
-	EventType  string
-	Reason     string
-	Message    string
-}
-
-func (f *fakeEventRecorder) Event(object runtime.Object, eventtype string, reason string, message string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	name := ""
-	if co, ok := object.(metav1.ObjectMetaAccessor); ok {
-		name = co.GetObjectMeta().GetName()
-	}
-	f.events = append(f.events, recordedEvent{
-		ObjectName: name,
-		EventType:  eventtype,
-		Reason:     reason,
-		Message:    message,
-	})
-}
-
-func (f *fakeEventRecorder) Eventf(object runtime.Object, eventtype string, reason string, messageFmt string, args ...interface{}) {
-	f.Event(object, eventtype, reason, fmt.Sprintf(messageFmt, args...))
-}
-
-func (f *fakeEventRecorder) AnnotatedEventf(object runtime.Object, annotations map[string]string, eventtype string, reason string, messageFmt string, args ...interface{}) {
-	f.Event(object, eventtype, reason, fmt.Sprintf(messageFmt, args...))
-}
 
 // --- Option A: automatic framework events ---
 
 func TestEventAppliedOnSuccessfulApply(t *testing.T) {
 	s := coreScheme()
-	rec := &fakeEventRecorder{}
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "my-cm", Namespace: "default", UID: "uid-1",
-				},
-			},
-		},
-	}
+	rec := &internalEventRecorder{}
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default", UID: "uid-1"},
+	})
 	mgr := &Manager{
 		scheme:          s,
-		cache:           fc,
+		cache:           store,
 		client:          &fakeClient{},
 		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
@@ -92,10 +48,11 @@ func TestEventAppliedOnSuccessfulApply(t *testing.T) {
 	primaryKey := types.NamespacedName{Name: "my-cm", Namespace: "default"}
 	mgr.runSubReconciler(context.Background(), mgr.reconcilers[0], primaryKey)
 
-	if len(rec.events) != 1 {
-		t.Fatalf("expected 1 event, got %d: %+v", len(rec.events), rec.events)
+	events := rec.events
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d: %+v", len(events), events)
 	}
-	ev := rec.events[0]
+	ev := events[0]
 	if ev.EventType != "Normal" {
 		t.Errorf("expected Normal event, got %q", ev.EventType)
 	}
@@ -112,19 +69,13 @@ func TestEventAppliedOnSuccessfulApply(t *testing.T) {
 
 func TestEventDeletedOnStaleOutputRemoval(t *testing.T) {
 	s := coreScheme()
-	rec := &fakeEventRecorder{}
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "my-cm", Namespace: "default", UID: "uid-1",
-				},
-			},
-		},
-	}
+	rec := &internalEventRecorder{}
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default", UID: "uid-1"},
+	})
 	mgr := &Manager{
 		scheme:          s,
-		cache:           fc,
+		cache:           store,
 		client:          &fakeClient{},
 		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
@@ -170,20 +121,14 @@ func TestEventDeletedOnStaleOutputRemoval(t *testing.T) {
 
 func TestEventReconcileFailedOnStatusReconcilerError(t *testing.T) {
 	s := coreScheme()
-	rec := &fakeEventRecorder{}
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "my-cm", Namespace: "default", UID: "uid-1",
-				},
-			},
-		},
-	}
+	rec := &internalEventRecorder{}
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default", UID: "uid-1"},
+	})
 	fakeC := &fakeClient{statusPatchErr: fmt.Errorf("status patch refused")}
 	mgr := &Manager{
 		scheme:          s,
-		cache:           fc,
+		cache:           store,
 		client:          fakeC,
 		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
@@ -206,10 +151,11 @@ func TestEventReconcileFailedOnStatusReconcilerError(t *testing.T) {
 	primaryKey := types.NamespacedName{Name: "my-cm", Namespace: "default"}
 	mgr.runStatusReconciler(context.Background(), mgr.statusReconcilers[0], primaryKey)
 
-	if len(rec.events) != 1 {
-		t.Fatalf("expected 1 event, got %d: %+v", len(rec.events), rec.events)
+	events := rec.events
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d: %+v", len(events), events)
 	}
-	ev := rec.events[0]
+	ev := events[0]
 	if ev.EventType != "Warning" {
 		t.Errorf("expected Warning event, got %q", ev.EventType)
 	}
@@ -223,18 +169,12 @@ func TestEventReconcileFailedOnStatusReconcilerError(t *testing.T) {
 
 func TestNoEventsWhenRecorderIsNil(t *testing.T) {
 	s := coreScheme()
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "my-cm", Namespace: "default", UID: "uid-1",
-				},
-			},
-		},
-	}
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default", UID: "uid-1"},
+	})
 	mgr := &Manager{
 		scheme:          s,
-		cache:           fc,
+		cache:           store,
 		client:          &fakeClient{},
 		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
@@ -242,7 +182,6 @@ func TestNoEventsWhenRecorderIsNil(t *testing.T) {
 		tracker:         newDependencyTracker(),
 		managerID:       "default",
 		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
-		// eventRecorder intentionally nil
 	}
 
 	configMaps := Watch[*corev1.ConfigMap](mgr)
@@ -256,26 +195,19 @@ func TestNoEventsWhenRecorderIsNil(t *testing.T) {
 
 	primaryKey := types.NamespacedName{Name: "my-cm", Namespace: "default"}
 	mgr.runSubReconciler(context.Background(), mgr.reconcilers[0], primaryKey)
-	// No panic — that's the assertion.
 }
 
 // --- Option B: per-reconciler RecordEvent ---
 
 func TestHandlerContextRecordEvent(t *testing.T) {
 	s := coreScheme()
-	rec := &fakeEventRecorder{}
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "my-cm", Namespace: "default", UID: "uid-1",
-				},
-			},
-		},
-	}
+	rec := &internalEventRecorder{}
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default", UID: "uid-1"},
+	})
 	mgr := &Manager{
 		scheme:          s,
-		cache:           fc,
+		cache:           store,
 		client:          &fakeClient{},
 		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
@@ -298,12 +230,11 @@ func TestHandlerContextRecordEvent(t *testing.T) {
 		t.Fatalf("reconcile error: %v", err)
 	}
 
-	// Find the user-emitted event (there should be exactly one since the
-	// reconciler returned nil so no apply/delete happens).
-	if len(rec.events) != 1 {
-		t.Fatalf("expected 1 event from RecordEvent, got %d: %+v", len(rec.events), rec.events)
+	events := rec.events
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event from RecordEvent, got %d: %+v", len(events), events)
 	}
-	ev := rec.events[0]
+	ev := events[0]
 	if ev.EventType != "Warning" {
 		t.Errorf("expected Warning, got %q", ev.EventType)
 	}
@@ -320,24 +251,17 @@ func TestHandlerContextRecordEvent(t *testing.T) {
 
 func TestHandlerContextRecordEventNilRecorder(t *testing.T) {
 	s := coreScheme()
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "my-cm", Namespace: "default", UID: "uid-1",
-				},
-			},
-		},
-	}
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default", UID: "uid-1"},
+	})
 	mgr := &Manager{
 		scheme:          s,
-		cache:           fc,
+		cache:           store,
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
 		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
 		tracker:         newDependencyTracker(),
 		managerID:       "default",
 		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
-		// eventRecorder intentionally nil
 	}
 
 	configMaps := Watch[*corev1.ConfigMap](mgr)
@@ -351,24 +275,17 @@ func TestHandlerContextRecordEventNilRecorder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile error: %v", err)
 	}
-	// No panic — that's the assertion.
 }
 
 func TestRecordEventInStatusReconciler(t *testing.T) {
 	s := coreScheme()
-	rec := &fakeEventRecorder{}
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "my-cm", Namespace: "default", UID: "uid-1",
-				},
-			},
-		},
-	}
+	rec := &internalEventRecorder{}
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default", UID: "uid-1"},
+	})
 	mgr := &Manager{
 		scheme:          s,
-		cache:           fc,
+		cache:           store,
 		client:          &fakeClient{},
 		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
@@ -395,26 +312,25 @@ func TestRecordEventInStatusReconciler(t *testing.T) {
 		t.Fatalf("status reconcile error: %v", err)
 	}
 
-	if len(rec.events) != 1 {
-		t.Fatalf("expected 1 event, got %d: %+v", len(rec.events), rec.events)
+	events := rec.events
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d: %+v", len(events), events)
 	}
-	if rec.events[0].Reason != "StatusComputed" {
-		t.Errorf("expected reason StatusComputed, got %q", rec.events[0].Reason)
+	if events[0].Reason != "StatusComputed" {
+		t.Errorf("expected reason StatusComputed, got %q", events[0].Reason)
 	}
-	if rec.events[0].ObjectName != "my-cm" {
-		t.Errorf("expected event on 'my-cm', got %q", rec.events[0].ObjectName)
+	if events[0].ObjectName != "my-cm" {
+		t.Errorf("expected event on 'my-cm', got %q", events[0].ObjectName)
 	}
 }
 
 func TestReconcileFailedEventNotEmittedWhenPrimaryGone(t *testing.T) {
 	s := coreScheme()
-	rec := &fakeEventRecorder{}
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{},
-	}
+	rec := &internalEventRecorder{}
+	store := newTestStore(s)
 	mgr := &Manager{
 		scheme:          s,
-		cache:           fc,
+		cache:           store,
 		client:          &fakeClient{},
 		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
@@ -430,12 +346,11 @@ func TestReconcileFailedEventNotEmittedWhenPrimaryGone(t *testing.T) {
 		return nil
 	})
 
-	// Primary doesn't exist → reconcile fails, getPrimary returns nil → no event.
 	mgr.runSubReconciler(context.Background(), mgr.reconcilers[0],
 		types.NamespacedName{Name: "gone", Namespace: "default"})
 
-	if len(rec.events) != 0 {
-		t.Errorf("expected 0 events when primary is gone (recordEvent is nil-safe), got %d: %+v",
-			len(rec.events), rec.events)
+	events := rec.events
+	if len(events) != 0 {
+		t.Errorf("expected 0 events when primary is gone, got %d: %+v", len(events), events)
 	}
 }

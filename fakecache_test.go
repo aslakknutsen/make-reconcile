@@ -3,7 +3,6 @@ package makereconcile
 import (
 	"context"
 	"fmt"
-	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -19,55 +18,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// fakeCache implements cache.Cache for testing. Only Get is implemented;
-// other methods panic to surface unexpected usage.
-type fakeCache struct {
-	objects map[types.NamespacedName]runtime.Object
-}
-
-func (f *fakeCache) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-	stored, ok := f.objects[key]
-	if !ok {
-		return fmt.Errorf("not found: %v", key)
-	}
-	// Copy via reflect to populate the target obj.
-	src := reflect.ValueOf(stored)
-	dst := reflect.ValueOf(obj)
-	if src.Type() != dst.Type() {
-		return fmt.Errorf("type mismatch: stored %T, target %T", stored, obj)
-	}
-	dst.Elem().Set(src.Elem())
-	return nil
-}
-
-func (f *fakeCache) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
-	return fmt.Errorf("fakeCache.List not implemented")
-}
-
-// Stubs to satisfy the cache.Cache interface.
-
-func (f *fakeCache) GetInformer(ctx context.Context, obj client.Object, opts ...cache.InformerGetOption) (cache.Informer, error) {
-	return nil, fmt.Errorf("not implemented")
-}
-func (f *fakeCache) GetInformerForKind(ctx context.Context, gvk schema.GroupVersionKind, opts ...cache.InformerGetOption) (cache.Informer, error) {
-	return nil, fmt.Errorf("not implemented")
-}
-func (f *fakeCache) RemoveInformer(ctx context.Context, obj client.Object) error {
-	return fmt.Errorf("not implemented")
-}
-func (f *fakeCache) Start(ctx context.Context) error                         { return nil }
-func (f *fakeCache) WaitForCacheSync(ctx context.Context) bool               { return true }
-func (f *fakeCache) IndexField(ctx context.Context, obj client.Object, field string, extractValue client.IndexerFunc) error {
-	return fmt.Errorf("not implemented")
-}
-
-// crdAwareCache extends fakeCache with GetInformer support for testing
+// crdAwareCache extends internalStore with GetInformer support for testing
 // pending watch behavior. GVKs listed in missingCRDs return a
 // NoKindMatchError from GetInformer; others succeed.
 type crdAwareCache struct {
-	fakeCache
-	scheme     *runtime.Scheme
-	mu         sync.Mutex
+	*internalStore
+	scheme      *runtime.Scheme
+	mu          sync.Mutex
 	missingCRDs map[schema.GroupVersionKind]bool
 	handlers    map[schema.GroupVersionKind][]toolscache.ResourceEventHandler
 }
@@ -77,16 +34,22 @@ func newCRDAwareCache(s *runtime.Scheme, objects map[types.NamespacedName]runtim
 	for _, gvk := range missing {
 		m[gvk] = true
 	}
-	c := &crdAwareCache{
-		fakeCache:   fakeCache{objects: objects},
-		scheme:      s,
-		missingCRDs: m,
-		handlers:    make(map[schema.GroupVersionKind][]toolscache.ResourceEventHandler),
+	var objs []client.Object
+	for nn, obj := range objects {
+		cObj, ok := obj.(client.Object)
+		if !ok {
+			continue
+		}
+		cObj.SetName(nn.Name)
+		cObj.SetNamespace(nn.Namespace)
+		objs = append(objs, cObj)
 	}
-	if c.fakeCache.objects == nil {
-		c.fakeCache.objects = make(map[types.NamespacedName]runtime.Object)
+	return &crdAwareCache{
+		internalStore: newTestStore(s, objs...),
+		scheme:        s,
+		missingCRDs:   m,
+		handlers:      make(map[schema.GroupVersionKind][]toolscache.ResourceEventHandler),
 	}
-	return c
 }
 
 func (c *crdAwareCache) GetInformer(ctx context.Context, obj client.Object, opts ...cache.InformerGetOption) (cache.Informer, error) {
@@ -148,17 +111,14 @@ func (fi *fakeInformer) HasSynced() bool                        { return true }
 func (fi *fakeInformer) IsStopped() bool                        { return false }
 
 // fakeClient implements client.Client with no-op writes for testing.
-// It supports List (for gcOrphans) and tracks Delete calls.
+// Used by internal tests that need features like statusPatchErr injection.
 type fakeClient struct {
 	client.Client
 	statusPatches  int
 	statusPatchErr error
 
-	// listObjects are returned by List, keyed by item GVK (not the "List" GVK).
 	listObjects map[schema.GroupVersionKind][]unstructured.Unstructured
-
-	// deleted records which objects were deleted, for test assertions.
-	deleted []types.NamespacedName
+	deleted     []types.NamespacedName
 }
 
 func (f *fakeClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {

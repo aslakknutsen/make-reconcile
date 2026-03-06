@@ -8,7 +8,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -75,16 +74,12 @@ func TestWatchNoPredicateDoesNotAddEntry(t *testing.T) {
 
 func TestEventHandlerOnAddPredicateRejects(t *testing.T) {
 	s := coreScheme()
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default", UID: "uid-1"},
-			},
-		},
-	}
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default", UID: "uid-1"},
+	})
 	mgr := &Manager{
 		scheme:          s,
-		cache:           fc,
+		cache:           store,
 		client:          &fakeClient{},
 		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
@@ -121,16 +116,12 @@ func TestEventHandlerOnAddPredicateRejects(t *testing.T) {
 
 func TestEventHandlerOnUpdatePredicateRejects(t *testing.T) {
 	s := coreScheme()
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default", UID: "uid-1"},
-			},
-		},
-	}
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default", UID: "uid-1"},
+	})
 	mgr := &Manager{
 		scheme:          s,
-		cache:           fc,
+		cache:           store,
 		client:          &fakeClient{},
 		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
@@ -174,16 +165,12 @@ func TestEventHandlerOnUpdatePredicateRejects(t *testing.T) {
 
 func TestEventHandlerOnUpdatePredicatePasses(t *testing.T) {
 	s := coreScheme()
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default", UID: "uid-1"},
-			},
-		},
-	}
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default", UID: "uid-1"},
+	})
 	mgr := &Manager{
 		scheme:          s,
-		cache:           fc,
+		cache:           store,
 		client:          &fakeClient{},
 		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
@@ -227,16 +214,12 @@ func TestEventHandlerOnUpdatePredicatePasses(t *testing.T) {
 
 func TestEventHandlerNilPredicateFuncDefaultsToPass(t *testing.T) {
 	s := coreScheme()
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default", UID: "uid-1"},
-			},
-		},
-	}
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default", UID: "uid-1"},
+	})
 	mgr := &Manager{
 		scheme:          s,
-		cache:           fc,
+		cache:           store,
 		client:          &fakeClient{},
 		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
@@ -318,19 +301,15 @@ func TestEventHandlerOnDeletePredicateRejects(t *testing.T) {
 
 func TestReconcilePredicateSkipsNonMatching(t *testing.T) {
 	s := coreScheme()
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "my-cm", Namespace: "default",
-					Labels: map[string]string{"role": "other"},
-				},
-			},
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "my-cm", Namespace: "default",
+			Labels: map[string]string{"role": "other"},
 		},
-	}
+	})
 	mgr := &Manager{
 		scheme:          s,
-		cache:           fc,
+		cache:           store,
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
 		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
 		tracker:         newDependencyTracker(),
@@ -365,19 +344,15 @@ func TestReconcilePredicateSkipsNonMatching(t *testing.T) {
 
 func TestReconcilePredicatePassesMatching(t *testing.T) {
 	s := coreScheme()
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "my-cm", Namespace: "default",
-					Labels: map[string]string{"role": "primary"},
-				},
-			},
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "my-cm", Namespace: "default",
+			Labels: map[string]string{"role": "primary"},
 		},
-	}
+	})
 	mgr := &Manager{
 		scheme:          s,
-		cache:           fc,
+		cache:           store,
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
 		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
 		tracker:         newDependencyTracker(),
@@ -410,16 +385,12 @@ func TestReconcilePredicatePassesMatching(t *testing.T) {
 
 func TestReconcilePredicateRejectClearsDeps(t *testing.T) {
 	s := coreScheme()
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default"},
-			},
-		},
-	}
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default"},
+	})
 	mgr := &Manager{
 		scheme:          s,
-		cache:           fc,
+		cache:           store,
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
 		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
 		tracker:         newDependencyTracker(),
@@ -466,16 +437,12 @@ func TestReconcilePredicateRejectClearsDeps(t *testing.T) {
 
 func TestReconcileManyPredicateSkips(t *testing.T) {
 	s := coreScheme()
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default"},
-			},
-		},
-	}
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default"},
+	})
 	mgr := &Manager{
 		scheme:          s,
-		cache:           fc,
+		cache:           store,
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
 		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
 		tracker:         newDependencyTracker(),
@@ -510,17 +477,13 @@ func TestReconcileManyPredicateSkips(t *testing.T) {
 
 func TestReconcileStatusPredicateSkips(t *testing.T) {
 	s := coreScheme()
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default"},
-			},
-		},
-	}
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default"},
+	})
 	fakeC := &fakeClient{}
 	mgr := &Manager{
 		scheme:          s,
-		cache:           fc,
+		cache:           store,
 		client:          fakeC,
 		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
@@ -559,17 +522,13 @@ func TestReconcileStatusPredicateSkips(t *testing.T) {
 
 func TestReconcileStatusPredicateRejectClearsDeps(t *testing.T) {
 	s := coreScheme()
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default"},
-			},
-		},
-	}
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default"},
+	})
 	fakeC := &fakeClient{}
 	mgr := &Manager{
 		scheme:          s,
-		cache:           fc,
+		cache:           store,
 		client:          fakeC,
 		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
@@ -659,20 +618,16 @@ func TestWithGenerationChangedPassesOnChange(t *testing.T) {
 
 func TestRunSubReconcilerWithPredicateDeletesPreviousOutputs(t *testing.T) {
 	s := coreScheme()
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "my-cm", Namespace: "default", UID: "uid-1",
-					Labels: map[string]string{"role": "other"},
-				},
-			},
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "my-cm", Namespace: "default", UID: "uid-1",
+			Labels: map[string]string{"role": "other"},
 		},
-	}
+	})
 	fakeC := &fakeClient{}
 	mgr := &Manager{
 		scheme:          s,
-		cache:           fc,
+		cache:           store,
 		client:          fakeC,
 		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),

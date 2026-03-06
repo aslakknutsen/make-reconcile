@@ -88,6 +88,16 @@ func WithEventRecorder(recorder record.EventRecorder) ManagerOption {
 	return func(m *Manager) { m.eventRecorder = recorder }
 }
 
+// WithCache sets the cache implementation. Intended for testing.
+func WithCache(c cache.Cache) ManagerOption {
+	return func(m *Manager) { m.cache = c }
+}
+
+// WithClient sets the client implementation. Intended for testing.
+func WithClient(c client.Client) ManagerOption {
+	return func(m *Manager) { m.client = c }
+}
+
 // NewManager creates a new Manager from a rest.Config and scheme.
 func NewManager(cfg *rest.Config, scheme *runtime.Scheme, opts ...ManagerOption) (*Manager, error) {
 	httpClient, err := rest.HTTPClientFor(cfg)
@@ -130,10 +140,11 @@ func NewManager(cfg *rest.Config, scheme *runtime.Scheme, opts ...ManagerOption)
 }
 
 // NewManagerForTest creates a Manager without a real cluster connection.
-// Intended for unit tests and Go testable examples only. The returned manager
-// supports Watch and Reconcile registration but cannot Start.
-func NewManagerForTest(scheme *runtime.Scheme) *Manager {
-	return &Manager{
+// Intended for unit tests and Go testable examples. The returned manager
+// supports Watch and Reconcile registration. Use WithCache and WithClient
+// to inject fakes for reconciler invocation, or use the mrtest.TestHarness.
+func NewManagerForTest(scheme *runtime.Scheme, opts ...ManagerOption) *Manager {
+	m := &Manager{
 		scheme:          scheme,
 		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
@@ -143,6 +154,10 @@ func NewManagerForTest(scheme *runtime.Scheme) *Manager {
 		managerID:       "default",
 		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
 	}
+	for _, o := range opts {
+		o(m)
+	}
+	return m
 }
 
 // Start begins watching all registered GVKs, routing events to sub-reconcilers,
@@ -576,6 +591,31 @@ func (m *Manager) fullReconcile(ctx context.Context) {
 			m.runStatusReconciler(ctx, sr, nn)
 		}
 	}
+}
+
+// HandleForTest simulates an informer event for the given GVK and key.
+// It runs the same two-phase logic as the real event handler: output
+// reconcilers first, then status reconcilers for affected primaries.
+// Intended for testing only.
+func (m *Manager) HandleForTest(ctx context.Context, gvk schema.GroupVersionKind, key types.NamespacedName) {
+	h := &eventHandler{mgr: m, gvk: gvk}
+	obj, err := m.scheme.New(gvk)
+	if err != nil {
+		return
+	}
+	cObj, ok := obj.(client.Object)
+	if !ok {
+		return
+	}
+	cObj.SetName(key.Name)
+	cObj.SetNamespace(key.Namespace)
+	h.handle(cObj)
+}
+
+// FullReconcileForTest runs all output reconcilers then all status reconcilers
+// for every primary resource in the cache. Intended for testing only.
+func (m *Manager) FullReconcileForTest(ctx context.Context) {
+	m.fullReconcile(ctx)
 }
 
 // gcOrphans deletes output resources that carry the managed-by label for this

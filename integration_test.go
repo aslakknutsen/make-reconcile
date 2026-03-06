@@ -25,12 +25,12 @@ func coreScheme() *runtime.Scheme {
 func TestReconcileRegistration(t *testing.T) {
 	s := coreScheme()
 	mgr := &Manager{
-		scheme:      s,
+		scheme:          s,
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
 		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
-		tracker:     newDependencyTracker(),
-		managerID:   "default",
-		lastOutputs: make(map[string]map[types.NamespacedName]bool),
+		tracker:         newDependencyTracker(),
+		managerID:       "default",
+		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
 	}
 
 	configMaps := Watch[*corev1.ConfigMap](mgr)
@@ -39,7 +39,6 @@ func TestReconcileRegistration(t *testing.T) {
 	_ = configMaps
 	_ = pods
 
-	// Verify the GVKs were registered.
 	cmGVK := schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"}
 	podGVK := schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Pod"}
 	if !mgr.watchedGVKs[cmGVK] {
@@ -53,12 +52,12 @@ func TestReconcileRegistration(t *testing.T) {
 func TestReconcileSubReconcilerRegistration(t *testing.T) {
 	s := coreScheme()
 	mgr := &Manager{
-		scheme:      s,
+		scheme:          s,
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
 		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
-		tracker:     newDependencyTracker(),
-		reconcilers: nil,
-		lastOutputs: make(map[string]map[types.NamespacedName]bool),
+		tracker:         newDependencyTracker(),
+		reconcilers:     nil,
+		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
 	}
 
 	configMaps := Watch[*corev1.ConfigMap](mgr)
@@ -89,29 +88,20 @@ func TestReconcileSubReconcilerRegistration(t *testing.T) {
 
 func TestSubReconcilerInvocation(t *testing.T) {
 	s := coreScheme()
-	// We need a fake cache that can serve Get calls.
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "my-cm",
-					Namespace: "default",
-					UID:       "cm-uid-1",
-				},
-				Data: map[string]string{"key": "value"},
-			},
-		},
-	}
+	store := newTestStore(s, &corev1.ConfigMap{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default", UID: "cm-uid-1"},
+		Data:       map[string]string{"key": "value"},
+	})
 
 	mgr := &Manager{
-		scheme:      s,
-		cache:       fc,
+		scheme:          s,
+		cache:           store,
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
 		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
-		tracker:     newDependencyTracker(),
-		reconcilers: nil,
-		lastOutputs: make(map[string]map[types.NamespacedName]bool),
+		tracker:         newDependencyTracker(),
+		reconcilers:     nil,
+		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
 	}
 
 	configMaps := Watch[*corev1.ConfigMap](mgr)
@@ -152,27 +142,23 @@ func TestSubReconcilerInvocation(t *testing.T) {
 
 func TestSubReconcilerNilMeansDelete(t *testing.T) {
 	s := coreScheme()
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default"},
-			},
-		},
-	}
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default"},
+	})
 	mgr := &Manager{
-		scheme:      s,
-		cache:       fc,
+		scheme:          s,
+		cache:           store,
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
 		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
-		tracker:     newDependencyTracker(),
-		managerID:   "default",
-		lastOutputs: make(map[string]map[types.NamespacedName]bool),
+		tracker:         newDependencyTracker(),
+		managerID:       "default",
+		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
 	}
 
 	configMaps := Watch[*corev1.ConfigMap](mgr)
 
 	Reconcile(mgr, configMaps, func(hc *HandlerContext, cm *corev1.ConfigMap) *appsv1.Deployment {
-		return nil // signal: deployment should not exist
+		return nil
 	})
 
 	r := mgr.reconcilers[0]
@@ -187,34 +173,27 @@ func TestSubReconcilerNilMeansDelete(t *testing.T) {
 
 func TestFetchTracksDependency(t *testing.T) {
 	s := coreScheme()
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "db-creds", Namespace: "default"},
-		Data:       map[string][]byte{"password": []byte("hunter2")},
-	}
-	cm := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default"},
-	}
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}:   cm,
-			{Name: "db-creds", Namespace: "default"}: secret,
+	store := newTestStore(s,
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default"}},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "db-creds", Namespace: "default"},
+			Data:       map[string][]byte{"password": []byte("hunter2")},
 		},
-	}
+	)
 	mgr := &Manager{
-		scheme:      s,
-		cache:       fc,
+		scheme:          s,
+		cache:           store,
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
 		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
-		tracker:     newDependencyTracker(),
-		managerID:   "default",
-		lastOutputs: make(map[string]map[types.NamespacedName]bool),
+		tracker:         newDependencyTracker(),
+		managerID:       "default",
+		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
 	}
 
 	configMaps := Watch[*corev1.ConfigMap](mgr)
 	secrets := Watch[*corev1.Secret](mgr)
 
 	Reconcile(mgr, configMaps, func(hc *HandlerContext, cm *corev1.ConfigMap) *appsv1.Deployment {
-		// Fetch a secret — this should create a tracked dependency.
 		sec := Fetch(hc, secrets, FilterName("db-creds", "default"))
 		_ = sec
 		return &appsv1.Deployment{
@@ -231,8 +210,6 @@ func TestFetchTracksDependency(t *testing.T) {
 		t.Fatalf("reconcile error: %v", err)
 	}
 
-	// The dependency tracker should now know that the "ConfigMap->Deployment" reconciler
-	// for primary "my-cm" depends on Secret "db-creds".
 	secretGVK := schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Secret"}
 	refs := mgr.tracker.Lookup(secretGVK, types.NamespacedName{Name: "db-creds", Namespace: "default"})
 	if len(refs) != 1 {
@@ -248,27 +225,19 @@ func TestFetchTracksDependency(t *testing.T) {
 
 func TestRunSubReconcilerTracksOutputDeps(t *testing.T) {
 	s := coreScheme()
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "my-cm",
-					Namespace: "default",
-					UID:       "cm-uid-1",
-				},
-			},
-		},
-	}
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default", UID: "cm-uid-1"},
+	})
 	mgr := &Manager{
-		scheme:      s,
-		cache:       fc,
-		client:      &fakeClient{},
-		log:         slog.Default(),
+		scheme:          s,
+		cache:           store,
+		client:          &fakeClient{},
+		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
 		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
-		tracker:     newDependencyTracker(),
-		managerID:   "default",
-		lastOutputs: make(map[string]map[types.NamespacedName]bool),
+		tracker:         newDependencyTracker(),
+		managerID:       "default",
+		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
 	}
 
 	configMaps := Watch[*corev1.ConfigMap](mgr)
@@ -285,8 +254,6 @@ func TestRunSubReconcilerTracksOutputDeps(t *testing.T) {
 	primaryKey := types.NamespacedName{Name: "my-cm", Namespace: "default"}
 	mgr.runSubReconciler(context.Background(), mgr.reconcilers[0], primaryKey)
 
-	// The output Deployment should now be tracked as a narrow dependency,
-	// so an external change to it would trigger re-reconciliation.
 	outputGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
 	outputNN := types.NamespacedName{Name: "my-cm-deploy", Namespace: "default"}
 	refs := mgr.tracker.Lookup(outputGVK, outputNN)
@@ -304,12 +271,12 @@ func TestRunSubReconcilerTracksOutputDeps(t *testing.T) {
 func TestReconcileStatusRegistration(t *testing.T) {
 	s := coreScheme()
 	mgr := &Manager{
-		scheme:      s,
+		scheme:          s,
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
 		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
-		tracker:     newDependencyTracker(),
-		managerID:   "default",
-		lastOutputs: make(map[string]map[types.NamespacedName]bool),
+		tracker:         newDependencyTracker(),
+		managerID:       "default",
+		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
 	}
 
 	configMaps := Watch[*corev1.ConfigMap](mgr)
@@ -336,33 +303,24 @@ func TestReconcileStatusRegistration(t *testing.T) {
 
 func TestReconcileStatusInvocation(t *testing.T) {
 	s := coreScheme()
-	deploy := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-cm-deploy",
-			Namespace: "default",
+	store := newTestStore(s,
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default"}},
+		&appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-cm-deploy", Namespace: "default"},
+			Status:     appsv1.DeploymentStatus{ReadyReplicas: 3},
 		},
-		Status: appsv1.DeploymentStatus{ReadyReplicas: 3},
-	}
-	cm := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default"},
-	}
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}:        cm,
-			{Name: "my-cm-deploy", Namespace: "default"}: deploy,
-		},
-	}
+	)
 	fakeC := &fakeClient{}
 	mgr := &Manager{
-		scheme:      s,
-		cache:       fc,
-		client:      fakeC,
-		log:         slog.Default(),
+		scheme:          s,
+		cache:           store,
+		client:          fakeC,
+		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
 		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
-		tracker:     newDependencyTracker(),
-		managerID:   "default",
-		lastOutputs: make(map[string]map[types.NamespacedName]bool),
+		tracker:         newDependencyTracker(),
+		managerID:       "default",
+		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
 	}
 
 	configMaps := Watch[*corev1.ConfigMap](mgr)
@@ -393,7 +351,6 @@ func TestReconcileStatusInvocation(t *testing.T) {
 		t.Errorf("expected 1 status patch call, got %d", fakeC.statusPatches)
 	}
 
-	// Verify dependency was tracked: changing the deployment should re-trigger.
 	deployGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
 	refs := mgr.tracker.Lookup(deployGVK, types.NamespacedName{Name: "my-cm-deploy", Namespace: "default"})
 	if len(refs) != 1 {
@@ -406,24 +363,20 @@ func TestReconcileStatusInvocation(t *testing.T) {
 
 func TestReconcileStatusNilSkipsWrite(t *testing.T) {
 	s := coreScheme()
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default"},
-			},
-		},
-	}
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default"},
+	})
 	fakeC := &fakeClient{}
 	mgr := &Manager{
-		scheme:      s,
-		cache:       fc,
-		client:      fakeC,
-		log:         slog.Default(),
+		scheme:          s,
+		cache:           store,
+		client:          fakeC,
+		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
 		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
-		tracker:     newDependencyTracker(),
-		managerID:   "default",
-		lastOutputs: make(map[string]map[types.NamespacedName]bool),
+		tracker:         newDependencyTracker(),
+		managerID:       "default",
+		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
 	}
 
 	configMaps := Watch[*corev1.ConfigMap](mgr)
@@ -447,28 +400,20 @@ func TestReconcileStatusNilSkipsWrite(t *testing.T) {
 
 func TestStatusRunsAfterOutputs(t *testing.T) {
 	s := coreScheme()
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "default"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "my-cm",
-					Namespace: "default",
-					UID:       "cm-uid-1",
-				},
-			},
-		},
-	}
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "default", UID: "cm-uid-1"},
+	})
 	fakeC := &fakeClient{}
 	mgr := &Manager{
-		scheme:      s,
-		cache:       fc,
-		client:      fakeC,
-		log:         slog.Default(),
+		scheme:          s,
+		cache:           store,
+		client:          fakeC,
+		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
 		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
-		tracker:     newDependencyTracker(),
-		managerID:   "default",
-		lastOutputs: make(map[string]map[types.NamespacedName]bool),
+		tracker:         newDependencyTracker(),
+		managerID:       "default",
+		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
 	}
 
 	configMaps := Watch[*corev1.ConfigMap](mgr)
@@ -493,7 +438,6 @@ func TestStatusRunsAfterOutputs(t *testing.T) {
 		return &cmStatus{Ready: true}
 	})
 
-	// Simulate what handle() does: trigger via a ConfigMap event.
 	cmGVK := schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"}
 	handler := &eventHandler{mgr: mgr, gvk: cmGVK}
 	handler.handle(&corev1.ConfigMap{
@@ -514,12 +458,12 @@ func TestStatusRunsAfterOutputs(t *testing.T) {
 func TestReconcileManyRegistration(t *testing.T) {
 	s := coreScheme()
 	mgr := &Manager{
-		scheme:      s,
+		scheme:          s,
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
 		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
-		tracker:     newDependencyTracker(),
-		managerID:   "default",
-		lastOutputs: make(map[string]map[types.NamespacedName]bool),
+		tracker:         newDependencyTracker(),
+		managerID:       "default",
+		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
 	}
 
 	configMaps := Watch[*corev1.ConfigMap](mgr)
@@ -538,14 +482,10 @@ func TestReconcileManyRegistration(t *testing.T) {
 		t.Errorf("unexpected ID: %s", mgr.reconcilers[0].ID())
 	}
 
-	fc := &fakeCache{
-		objects: map[types.NamespacedName]runtime.Object{
-			{Name: "my-cm", Namespace: "ns"}: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "ns"},
-			},
-		},
-	}
-	mgr.cache = fc
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "ns"},
+	})
+	mgr.cache = store
 
 	desired, err := mgr.reconcilers[0].Reconcile(context.Background(), mgr, types.NamespacedName{Name: "my-cm", Namespace: "ns"})
 	if err != nil {
@@ -570,13 +510,13 @@ func TestGCOrphansDeletesUnclaimedResources(t *testing.T) {
 	}
 
 	mgr := &Manager{
-		scheme:      s,
-		client:      fakeC,
-		log:         slog.Default(),
+		scheme:          s,
+		client:          fakeC,
+		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
 		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
-		tracker:     newDependencyTracker(),
-		managerID:   "test-mgr",
+		tracker:         newDependencyTracker(),
+		managerID:       "test-mgr",
 		lastOutputs: map[string]map[types.NamespacedName]bool{
 			"ConfigMap->Deployment/default/my-cm": {
 				{Name: "wanted-deploy", Namespace: "default"}: true,
@@ -612,13 +552,13 @@ func TestGCOrphansPreservesClaimedResources(t *testing.T) {
 	}
 
 	mgr := &Manager{
-		scheme:      s,
-		client:      fakeC,
-		log:         slog.Default(),
+		scheme:          s,
+		client:          fakeC,
+		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
 		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
-		tracker:     newDependencyTracker(),
-		managerID:   "test-mgr",
+		tracker:         newDependencyTracker(),
+		managerID:       "test-mgr",
 		lastOutputs: map[string]map[types.NamespacedName]bool{
 			"ConfigMap->Deployment/default/my-cm": {
 				{Name: "my-deploy", Namespace: "default"}: true,
@@ -651,14 +591,14 @@ func TestGCOrphansManagerIDIsolation(t *testing.T) {
 	}
 
 	mgr := &Manager{
-		scheme:      s,
-		client:      fakeC,
-		log:         slog.Default(),
+		scheme:          s,
+		client:          fakeC,
+		log:             slog.Default(),
 		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
 		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
-		tracker:     newDependencyTracker(),
-		managerID:   "my-mgr",
-		lastOutputs: make(map[string]map[types.NamespacedName]bool),
+		tracker:         newDependencyTracker(),
+		managerID:       "my-mgr",
+		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
 	}
 
 	configMaps := Watch[*corev1.ConfigMap](mgr)
