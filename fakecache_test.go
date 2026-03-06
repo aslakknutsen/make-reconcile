@@ -61,7 +61,8 @@ func (f *fakeCache) IndexField(ctx context.Context, obj client.Object, field str
 // It supports List (for gcOrphans) and tracks Delete calls.
 type fakeClient struct {
 	client.Client
-	statusPatches int
+	statusPatches  int
+	statusPatchErr error
 
 	// listObjects are returned by List, keyed by item GVK (not the "List" GVK).
 	listObjects map[schema.GroupVersionKind][]unstructured.Unstructured
@@ -126,7 +127,7 @@ func (f *fakeStatusWriter) Update(ctx context.Context, obj client.Object, opts .
 
 func (f *fakeStatusWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
 	f.fc.statusPatches++
-	return nil
+	return f.fc.statusPatchErr
 }
 
 func (f *fakeStatusWriter) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
