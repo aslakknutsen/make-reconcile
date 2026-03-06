@@ -7,8 +7,11 @@ import (
 )
 
 func RegisterAll(mgr *mr.Manager) {
-	engines := mr.Watch[*Engine](mgr)
-	ruleSets := mr.Watch[*RuleSet](mgr)
+	// WithGenerationChanged filters out status-only updates (which don't
+	// increment .metadata.generation). This matches the original controller's
+	// use of predicate.GenerationChangedPredicate on both Engine and RuleSet.
+	engines := mr.Watch[*Engine](mgr, mr.WithGenerationChanged())
+	ruleSets := mr.Watch[*RuleSet](mgr, mr.WithGenerationChanged())
 	configMaps := mr.Watch[*corev1.ConfigMap](mgr)
 	wasmPlugins := mr.Watch[*WasmPlugin](mgr)
 	pods := mr.Watch[*corev1.Pod](mgr)
@@ -59,20 +62,15 @@ func RegisterAll(mgr *mr.Manager) {
 	//
 	// 2. Driver dispatch (selectDriver):
 	//    The original switches on engine.Spec.Driver.Istio vs future drivers.
-	//    In make-reconcile, you'd register different reconcilers per driver
-	//    and have each one return nil when its driver isn't selected:
-	//      mr.Reconcile(mgr, engines, IstioWasmReconciler)    // returns nil if not istio
-	//      mr.Reconcile(mgr, engines, EnvoyNativeReconciler)  // returns nil if not envoy
-	//    This works but means all drivers run for every Engine. A predicate
-	//    on Watch or Reconcile would be more efficient.
+	//    With reconciler-level predicates, each driver gets its own reconciler
+	//    that only runs for matching Engines:
+	//      mr.Reconcile(mgr, engines, IstioWasmReconciler,
+	//          mr.WithPredicate(func(e *Engine) bool { return e.Spec.Driver == "istio" }))
+	//      mr.Reconcile(mgr, engines, EnvoyNativeReconciler,
+	//          mr.WithPredicate(func(e *Engine) bool { return e.Spec.Driver == "envoy" }))
 	//
 	// 3. Coraza WAF validation (coraza.NewWAF):
 	//    The original validates rules using the coraza library before caching.
 	//    This fits fine inside the reconciler function — it's pure computation.
 	//    Omitted here for dependency simplicity.
-	//
-	// 4. GenerationChangedPredicate:
-	//    The original only reconciles on spec changes (generation increment),
-	//    not on status-only updates. make-reconcile triggers on any change.
-	//    This is wasteful but correct — the reconciler is idempotent.
 }

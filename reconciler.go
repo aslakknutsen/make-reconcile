@@ -21,12 +21,30 @@ type subReconciler interface {
 	Reconcile(ctx context.Context, mgr *Manager, primaryKey types.NamespacedName) ([]client.Object, error)
 }
 
+// ReconcileOption configures a Reconcile, ReconcileMany, or ReconcileStatus call.
+type ReconcileOption[P client.Object] func(*reconcileConfig[P])
+
+type reconcileConfig[P client.Object] struct {
+	predicate func(P) bool
+}
+
+// WithPredicate adds a filter that runs after fetching the primary but before
+// calling the reconciler function. If the predicate returns false, the
+// reconciler is skipped for that primary instance (equivalent to returning nil).
+// Stale dependencies and outputs are cleaned up automatically.
+func WithPredicate[P client.Object](fn func(P) bool) ReconcileOption[P] {
+	return func(cfg *reconcileConfig[P]) {
+		cfg.predicate = fn
+	}
+}
+
 // typedSubReconciler implements subReconciler for a one-to-one mapping.
 type typedSubReconciler[P client.Object, T client.Object] struct {
 	id         string
 	primaryGVK schema.GroupVersionKind
 	outputGVK  schema.GroupVersionKind
 	fn         func(*HandlerContext, P) T
+	predicate  func(P) bool
 }
 
 func (r *typedSubReconciler[P, T]) ID() string                          { return r.id }
@@ -37,6 +55,12 @@ func (r *typedSubReconciler[P, T]) Reconcile(ctx context.Context, mgr *Manager, 
 	primary := newTypedObject[P]()
 	if err := mgr.cache.Get(ctx, primaryKey, primary); err != nil {
 		return nil, fmt.Errorf("get primary %v: %w", primaryKey, err)
+	}
+
+	if r.predicate != nil && !r.predicate(primary) {
+		ref := reconcilerRef{ReconcilerID: r.id, PrimaryKey: primaryKey}
+		mgr.tracker.SetDeps(ref, nil, nil)
+		return nil, nil
 	}
 
 	hc := newHandlerContext(ctx, mgr)
@@ -57,6 +81,7 @@ type typedManySubReconciler[P client.Object, T client.Object] struct {
 	primaryGVK schema.GroupVersionKind
 	outputGVK  schema.GroupVersionKind
 	fn         func(*HandlerContext, P) []T
+	predicate  func(P) bool
 }
 
 func (r *typedManySubReconciler[P, T]) ID() string                          { return r.id }
@@ -67,6 +92,12 @@ func (r *typedManySubReconciler[P, T]) Reconcile(ctx context.Context, mgr *Manag
 	primary := newTypedObject[P]()
 	if err := mgr.cache.Get(ctx, primaryKey, primary); err != nil {
 		return nil, fmt.Errorf("get primary %v: %w", primaryKey, err)
+	}
+
+	if r.predicate != nil && !r.predicate(primary) {
+		ref := reconcilerRef{ReconcilerID: r.id, PrimaryKey: primaryKey}
+		mgr.tracker.SetDeps(ref, nil, nil)
+		return nil, nil
 	}
 
 	hc := newHandlerContext(ctx, mgr)
@@ -96,7 +127,12 @@ func (r *typedManySubReconciler[P, T]) Reconcile(ctx context.Context, mgr *Manag
 //	makereconcile.Reconcile(mgr, apps, func(ctx *makereconcile.HandlerContext, app *MyApp) *appsv1.Deployment {
 //	    return &appsv1.Deployment{...}
 //	})
-func Reconcile[P client.Object, T client.Object](mgr *Manager, primary *Collection[P], fn func(*HandlerContext, P) T) {
+func Reconcile[P client.Object, T client.Object](mgr *Manager, primary *Collection[P], fn func(*HandlerContext, P) T, opts ...ReconcileOption[P]) {
+	var cfg reconcileConfig[P]
+	for _, o := range opts {
+		o(&cfg)
+	}
+
 	outputGVK := gvkFor[T](mgr)
 	id := fmt.Sprintf("%s->%s", primary.gvk.Kind, outputGVK.Kind)
 
@@ -116,6 +152,7 @@ func Reconcile[P client.Object, T client.Object](mgr *Manager, primary *Collecti
 		primaryGVK: primary.gvk,
 		outputGVK:  outputGVK,
 		fn:         fn,
+		predicate:  cfg.predicate,
 	}
 	mgr.reconcilers = append(mgr.reconcilers, r)
 	mgr.watchedGVKs[outputGVK] = true
@@ -125,7 +162,12 @@ func Reconcile[P client.Object, T client.Object](mgr *Manager, primary *Collecti
 // ReconcileMany registers a sub-reconciler that produces multiple output resources
 // for each primary resource instance. The framework manages the full set: resources
 // returned are applied; previously-returned resources no longer in the set are deleted.
-func ReconcileMany[P client.Object, T client.Object](mgr *Manager, primary *Collection[P], fn func(*HandlerContext, P) []T) {
+func ReconcileMany[P client.Object, T client.Object](mgr *Manager, primary *Collection[P], fn func(*HandlerContext, P) []T, opts ...ReconcileOption[P]) {
+	var cfg reconcileConfig[P]
+	for _, o := range opts {
+		o(&cfg)
+	}
+
 	outputGVK := gvkFor[T](mgr)
 	id := fmt.Sprintf("%s->[]%s", primary.gvk.Kind, outputGVK.Kind)
 
@@ -145,6 +187,7 @@ func ReconcileMany[P client.Object, T client.Object](mgr *Manager, primary *Coll
 		primaryGVK: primary.gvk,
 		outputGVK:  outputGVK,
 		fn:         fn,
+		predicate:  cfg.predicate,
 	}
 	mgr.reconcilers = append(mgr.reconcilers, r)
 	mgr.watchedGVKs[outputGVK] = true
@@ -163,6 +206,7 @@ type typedStatusSubReconciler[P client.Object, S any] struct {
 	id         string
 	primaryGVK schema.GroupVersionKind
 	fn         func(*HandlerContext, P) *S
+	predicate  func(P) bool
 }
 
 func (r *typedStatusSubReconciler[P, S]) ID() string                          { return r.id }
@@ -172,6 +216,12 @@ func (r *typedStatusSubReconciler[P, S]) ReconcileStatus(ctx context.Context, mg
 	primary := newTypedObject[P]()
 	if err := mgr.cache.Get(ctx, primaryKey, primary); err != nil {
 		return fmt.Errorf("get primary %v: %w", primaryKey, err)
+	}
+
+	if r.predicate != nil && !r.predicate(primary) {
+		ref := reconcilerRef{ReconcilerID: r.id, PrimaryKey: primaryKey}
+		mgr.tracker.SetDeps(ref, nil, nil)
+		return nil
 	}
 
 	hc := newHandlerContext(ctx, mgr)
@@ -203,7 +253,12 @@ func (r *typedStatusSubReconciler[P, S]) ReconcileStatus(ctx context.Context, mg
 //	    }
 //	    return &MyAppStatus{Ready: false}
 //	})
-func ReconcileStatus[P client.Object, S any](mgr *Manager, primary *Collection[P], fn func(*HandlerContext, P) *S) {
+func ReconcileStatus[P client.Object, S any](mgr *Manager, primary *Collection[P], fn func(*HandlerContext, P) *S, opts ...ReconcileOption[P]) {
+	var cfg reconcileConfig[P]
+	for _, o := range opts {
+		o(&cfg)
+	}
+
 	id := fmt.Sprintf("%s.status", primary.gvk.Kind)
 
 	mgr.mu.Lock()
@@ -221,6 +276,7 @@ func ReconcileStatus[P client.Object, S any](mgr *Manager, primary *Collection[P
 		id:         id,
 		primaryGVK: primary.gvk,
 		fn:         fn,
+		predicate:  cfg.predicate,
 	}
 	mgr.statusReconcilers = append(mgr.statusReconcilers, r)
 	mgr.mu.Unlock()

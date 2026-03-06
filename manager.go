@@ -35,6 +35,7 @@ type Manager struct {
 	reconcilers       []subReconciler
 	statusReconcilers []statusSubReconciler
 	watchedGVKs       map[schema.GroupVersionKind]bool
+	watchPredicates   map[schema.GroupVersionKind][]EventPredicate
 	tracker           *dependencyTracker
 
 	resyncPeriod time.Duration
@@ -88,17 +89,18 @@ func NewManager(cfg *rest.Config, scheme *runtime.Scheme, opts ...ManagerOption)
 	}
 
 	m := &Manager{
-		client:       cl,
-		cache:        c,
-		scheme:       scheme,
-		restMapper:   mapper,
-		restConfig:   cfg,
-		log:          slog.Default(),
-		watchedGVKs:  make(map[schema.GroupVersionKind]bool),
-		tracker:      newDependencyTracker(),
-		resyncPeriod: 5 * time.Minute,
-		managerID:    "default",
-		lastOutputs:  make(map[string]map[types.NamespacedName]bool),
+		client:          cl,
+		cache:           c,
+		scheme:          scheme,
+		restMapper:      mapper,
+		restConfig:      cfg,
+		log:             slog.Default(),
+		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
+		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
+		tracker:         newDependencyTracker(),
+		resyncPeriod:    5 * time.Minute,
+		managerID:       "default",
+		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
 	}
 	for _, o := range opts {
 		o(m)
@@ -111,13 +113,14 @@ func NewManager(cfg *rest.Config, scheme *runtime.Scheme, opts ...ManagerOption)
 // supports Watch and Reconcile registration but cannot Start.
 func NewManagerForTest(scheme *runtime.Scheme) *Manager {
 	return &Manager{
-		scheme:       scheme,
-		log:          slog.Default(),
-		watchedGVKs:  make(map[schema.GroupVersionKind]bool),
-		tracker:      newDependencyTracker(),
-		resyncPeriod: 5 * time.Minute,
-		managerID:    "default",
-		lastOutputs:  make(map[string]map[types.NamespacedName]bool),
+		scheme:          scheme,
+		log:             slog.Default(),
+		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
+		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
+		tracker:         newDependencyTracker(),
+		resyncPeriod:    5 * time.Minute,
+		managerID:       "default",
+		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
 	}
 }
 
@@ -176,38 +179,63 @@ func (m *Manager) registerHandler(ctx context.Context, gvk schema.GroupVersionKi
 		return fmt.Errorf("get informer for %v: %w", gvk, err)
 	}
 
-	handler := &eventHandler{mgr: m, gvk: gvk}
+	handler := &eventHandler{mgr: m, gvk: gvk, predicates: m.watchPredicates[gvk]}
 	informer.AddEventHandler(handler)
 	return nil
 }
 
 // eventHandler routes informer events to the appropriate sub-reconcilers.
 type eventHandler struct {
-	mgr *Manager
-	gvk schema.GroupVersionKind
+	mgr        *Manager
+	gvk        schema.GroupVersionKind
+	predicates []EventPredicate
 }
 
 func (h *eventHandler) OnAdd(obj interface{}, _ bool) {
-	h.handle(obj)
+	cObj, ok := obj.(client.Object)
+	if !ok {
+		return
+	}
+	for _, p := range h.predicates {
+		if p.Create != nil && !p.Create(cObj) {
+			return
+		}
+	}
+	h.handle(cObj)
 }
 
-func (h *eventHandler) OnUpdate(_, newObj interface{}) {
-	h.handle(newObj)
+func (h *eventHandler) OnUpdate(oldObj, newObj interface{}) {
+	newCObj, ok := newObj.(client.Object)
+	if !ok {
+		return
+	}
+	oldCObj, _ := oldObj.(client.Object)
+	for _, p := range h.predicates {
+		if p.Update != nil && !p.Update(oldCObj, newCObj) {
+			return
+		}
+	}
+	h.handle(newCObj)
 }
 
 func (h *eventHandler) OnDelete(obj interface{}) {
 	if d, ok := obj.(toolscache.DeletedFinalStateUnknown); ok {
 		obj = d.Obj
 	}
-	h.handle(obj)
-}
-
-func (h *eventHandler) handle(obj interface{}) {
 	cObj, ok := obj.(client.Object)
 	if !ok {
 		return
 	}
-	nn := types.NamespacedName{Name: cObj.GetName(), Namespace: cObj.GetNamespace()}
+	for _, p := range h.predicates {
+		if p.Delete != nil && !p.Delete(cObj) {
+			return
+		}
+	}
+	h.handle(cObj)
+}
+
+func (h *eventHandler) handle(obj client.Object) {
+	nn := types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}
 	ctx := context.Background()
 
 	// Track which primaries were affected so we can run status reconcilers after.

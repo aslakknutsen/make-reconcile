@@ -8,19 +8,27 @@ func RegisterAll(mgr *mr.Manager) {
 	gatewayClasses := mr.Watch[*GatewayClass](mgr)
 	istios := mr.Watch[*Istio](mgr)
 
+	isOurGatewayClass := mr.WithPredicate(func(gc *GatewayClass) bool {
+		return gc.Spec.ControllerName == OpenShiftGatewayClassControllerName
+	})
+
 	// GatewayClass -> Istio CR
 	//
 	// The original controller does this through ensureIstioOLM which
 	// manually checks existence, creates or updates, diffs, and logs.
 	// Here the framework handles all of that via SSA.
-	mr.Reconcile(mgr, gatewayClasses, IstioReconciler)
+	//
+	// The predicate ensures only GatewayClasses belonging to the
+	// OpenShift gateway controller are processed. Other controllers'
+	// GatewayClasses are ignored without invoking the reconciler.
+	mr.Reconcile(mgr, gatewayClasses, IstioReconciler, isOurGatewayClass)
 
 	// GatewayClass -> status conditions
 	//
 	// The original embeds status computation inside the main Reconcile
 	// method and patches it inline. Here it's a separate reconciler that
 	// only re-runs when the Istio CR's status (its dependency) changes.
-	mr.ReconcileStatus(mgr, gatewayClasses, StatusReconciler(istios))
+	mr.ReconcileStatus(mgr, gatewayClasses, StatusReconciler(istios), isOurGatewayClass)
 
 	// --- Things from the original controller that are NOT modeled here ---
 	//
@@ -49,10 +57,4 @@ func RegisterAll(mgr *mr.Manager) {
 	// 6. Custom event source (SailLibrarySource channel bridge):
 	//    The Sail Library pushes events via a Go channel.
 	//    make-reconcile has no concept of external event sources.
-	//
-	// 7. Predicate-based filtering (isOurGatewayClass, notIstioGatewayClass):
-	//    The original filters events to only process GatewayClasses with
-	//    a specific controllerName. make-reconcile processes all instances
-	//    of a watched type. Filtering would need to be done inside the
-	//    reconciler function (early return nil).
 }
