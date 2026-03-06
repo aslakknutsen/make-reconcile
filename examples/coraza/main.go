@@ -6,10 +6,14 @@ import (
 	"os"
 	"os/signal"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/record"
 
 	mr "github.com/aslakknutsen/make-reconcile"
 )
@@ -31,9 +35,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		log.Error("failed to create clientset", "error", err)
+		os.Exit(1)
+	}
+	eventBroadcaster := record.NewBroadcaster()
+	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: clientset.CoreV1().Events("")})
+	recorder := eventBroadcaster.NewRecorder(scheme, corev1.EventSource{Component: "coraza-operator"})
+
 	mgr, err := mr.NewManager(cfg, scheme,
 		mr.WithLogger(log),
 		mr.WithManagerID("coraza-operator"),
+		mr.WithEventRecorder(recorder),
 	)
 	if err != nil {
 		log.Error("failed to create manager", "error", err)

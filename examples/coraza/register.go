@@ -30,7 +30,8 @@ func RegisterAll(mgr *mr.Manager) {
 	//
 	// Here, step 1 is the reconciler function. Steps 2-3 are handled by
 	// the framework (owner ref + SSA). Steps 4-5 are the status reconciler.
-	// Step 6 (events) has no equivalent — see analysis.
+	// Step 6 is now handled by the framework (automatic Applied/Deleted
+	// events via WithEventRecorder) plus custom events via RecordEvent.
 	mr.Reconcile(mgr, engines, WasmPluginReconciler)
 
 	// Engine -> status (conditions + matched gateways)
@@ -57,8 +58,11 @@ func RegisterAll(mgr *mr.Manager) {
 	//
 	// 1. Event recording (r.Recorder.Eventf):
 	//    The original fires k8s Events for ConfigMapNotFound, InvalidRuleSet,
-	//    WasmPluginCreated, etc. make-reconcile has no event recording hook.
-	//    Could be added as a callback/middleware on reconciler functions.
+	//    WasmPluginCreated, etc. The framework now handles this via two mechanisms:
+	//    - Automatic events: WithEventRecorder emits Applied/Deleted/ReconcileFailed
+	//      events without any code in the reconciler functions.
+	//    - Custom events: hc.RecordEvent("Warning", "ConfigMapNotFound", ...) in
+	//      reconciler functions for domain-specific events. See AggregatedRulesReconciler.
 	//
 	// 2. Driver dispatch (selectDriver):
 	//    The original switches on engine.Spec.Driver.Istio vs future drivers.

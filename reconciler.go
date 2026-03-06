@@ -63,7 +63,7 @@ func (r *typedSubReconciler[P, T]) Reconcile(ctx context.Context, mgr *Manager, 
 		return nil, nil
 	}
 
-	hc := newHandlerContext(ctx, mgr)
+	hc := newHandlerContext(ctx, mgr, primary)
 	result := r.fn(hc, primary)
 
 	ref := reconcilerRef{ReconcilerID: r.id, PrimaryKey: primaryKey}
@@ -100,7 +100,7 @@ func (r *typedManySubReconciler[P, T]) Reconcile(ctx context.Context, mgr *Manag
 		return nil, nil
 	}
 
-	hc := newHandlerContext(ctx, mgr)
+	hc := newHandlerContext(ctx, mgr, primary)
 	results := r.fn(hc, primary)
 
 	ref := reconcilerRef{ReconcilerID: r.id, PrimaryKey: primaryKey}
@@ -224,7 +224,7 @@ func (r *typedStatusSubReconciler[P, S]) ReconcileStatus(ctx context.Context, mg
 		return nil
 	}
 
-	hc := newHandlerContext(ctx, mgr)
+	hc := newHandlerContext(ctx, mgr, primary)
 	status := r.fn(hc, primary)
 
 	ref := reconcilerRef{ReconcilerID: r.id, PrimaryKey: primaryKey}

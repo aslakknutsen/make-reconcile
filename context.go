@@ -15,15 +15,29 @@ import (
 
 // HandlerContext is passed to sub-reconciler functions. It tracks which
 // resources are read via Fetch so the framework can build a dependency graph.
+// It also provides RecordEvent for emitting custom Kubernetes events on the
+// primary resource being reconciled.
 type HandlerContext struct {
 	ctx        context.Context
 	mgr        *Manager
+	primary    client.Object
 	narrowDeps []depKey
 	broadDeps  []depKeyBroad
 }
 
-func newHandlerContext(ctx context.Context, mgr *Manager) *HandlerContext {
-	return &HandlerContext{ctx: ctx, mgr: mgr}
+func newHandlerContext(ctx context.Context, mgr *Manager, primary client.Object) *HandlerContext {
+	return &HandlerContext{ctx: ctx, mgr: mgr, primary: primary}
+}
+
+// RecordEvent emits a Kubernetes event on the primary resource being reconciled.
+// eventType is "Normal" or "Warning". reason is a short CamelCase identifier
+// (e.g. "ConfigMapNotFound", "InvalidRuleSet"). This is a no-op if no event
+// recorder was configured on the Manager via WithEventRecorder.
+func (hc *HandlerContext) RecordEvent(eventType, reason, messageFmt string, args ...any) {
+	if hc.mgr.eventRecorder == nil {
+		return
+	}
+	hc.mgr.eventRecorder.Eventf(hc.primary, eventType, reason, messageFmt, args...)
 }
 
 // Filter narrows the set of resources returned by Fetch/FetchAll.

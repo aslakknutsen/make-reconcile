@@ -36,11 +36,15 @@ func AggregatedRulesReconciler(configMaps *mr.Collection[*corev1.ConfigMap]) fun
 		for i, rule := range rs.Spec.Rules {
 			cm := mr.Fetch(hc, configMaps, mr.FilterName(rule.Name, rs.Namespace))
 			if cm == nil {
+				hc.RecordEvent("Warning", "ConfigMapNotFound",
+					"Referenced ConfigMap %s not found in namespace %s", rule.Name, rs.Namespace)
 				return nil
 			}
 
 			data, ok := cm.Data["rules"]
 			if !ok {
+				hc.RecordEvent("Warning", "InvalidRuleSet",
+					"ConfigMap %s missing 'rules' key", rule.Name)
 				return nil
 			}
 

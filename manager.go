@@ -14,10 +14,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
+	toolscache "k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
-	toolscache "k8s.io/client-go/tools/cache"
 )
 
 // Manager is the central coordinator. It holds the kubernetes client, cache,
@@ -38,8 +39,9 @@ type Manager struct {
 	watchPredicates   map[schema.GroupVersionKind][]EventPredicate
 	tracker           *dependencyTracker
 
-	resyncPeriod time.Duration
-	managerID    string
+	resyncPeriod  time.Duration
+	managerID     string
+	eventRecorder record.EventRecorder
 
 	// lastOutputs tracks which output resource keys were produced by each
 	// (reconciler, primary) pair on the last run. Used to detect deletions
@@ -65,6 +67,14 @@ func WithLogger(l *slog.Logger) ManagerOption {
 // don't interfere with each other. Default is "default".
 func WithManagerID(id string) ManagerOption {
 	return func(m *Manager) { m.managerID = id }
+}
+
+// WithEventRecorder sets the Kubernetes event recorder used to emit events
+// on primary resources. When set, the framework automatically emits events
+// for successful applies, stale output deletions, and reconciliation errors.
+// Reconciler functions can also emit custom events via HandlerContext.RecordEvent.
+func WithEventRecorder(recorder record.EventRecorder) ManagerOption {
+	return func(m *Manager) { m.eventRecorder = recorder }
 }
 
 // NewManager creates a new Manager from a rest.Config and scheme.
@@ -306,6 +316,9 @@ func (m *Manager) runSubReconciler(ctx context.Context, r subReconciler, primary
 			"primary", primaryKey,
 			"error", err,
 		)
+		m.recordEvent(m.getPrimary(ctx, r.PrimaryGVK(), primaryKey),
+			"Warning", "ReconcileFailed",
+			"Reconciler %s failed: %v", r.ID(), err)
 		return
 	}
 
@@ -331,6 +344,11 @@ func (m *Manager) runSubReconciler(ctx context.Context, r subReconciler, primary
 				"resource", onn,
 				"error", err,
 			)
+			m.recordEvent(primaryObj, "Warning", "ApplyFailed",
+				"Failed to apply %s %s: %v", r.OutputGVK().Kind, onn, err)
+		} else {
+			m.recordEvent(primaryObj, "Normal", "Applied",
+				"Applied %s %s", r.OutputGVK().Kind, onn)
 		}
 	}
 
@@ -359,6 +377,13 @@ func (m *Manager) runSubReconciler(ctx context.Context, r subReconciler, primary
 					"resource", prev,
 					"error", err,
 				)
+				m.recordEvent(m.getPrimary(ctx, r.PrimaryGVK(), primaryKey),
+					"Warning", "DeleteFailed",
+					"Failed to delete stale %s %s: %v", r.OutputGVK().Kind, prev, err)
+			} else {
+				m.recordEvent(m.getPrimary(ctx, r.PrimaryGVK(), primaryKey),
+					"Normal", "Deleted",
+					"Deleted stale %s %s", r.OutputGVK().Kind, prev)
 			}
 		}
 	}
@@ -386,7 +411,19 @@ func (m *Manager) runStatusReconciler(ctx context.Context, sr statusSubReconcile
 			"primary", primaryKey,
 			"error", err,
 		)
+		m.recordEvent(m.getPrimary(ctx, sr.PrimaryGVK(), primaryKey),
+			"Warning", "ReconcileFailed",
+			"Status reconciler %s failed: %v", sr.ID(), err)
 	}
+}
+
+// recordEvent emits a Kubernetes event on the given object if an event
+// recorder has been configured. Safe to call with a nil object or nil recorder.
+func (m *Manager) recordEvent(obj client.Object, eventType, reason, messageFmt string, args ...any) {
+	if m.eventRecorder == nil || obj == nil {
+		return
+	}
+	m.eventRecorder.Eventf(obj, eventType, reason, messageFmt, args...)
 }
 
 func (m *Manager) fullReconcile(ctx context.Context) {
