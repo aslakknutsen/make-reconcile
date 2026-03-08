@@ -48,6 +48,11 @@ type Manager struct {
 	// when the set of outputs shrinks.
 	lastOutputs map[string]map[types.NamespacedName]bool
 
+	// cleanupFns maps a primary GVK to its registered cleanup function.
+	// Registered via OnDelete. When the primary is being deleted (finalizer
+	// pending), the cleanup function runs instead of normal reconciliation.
+	cleanupFns map[schema.GroupVersionKind]cleanupEntry
+
 	// pendingWatches holds GVKs whose CRDs were not available at startup.
 	// A background goroutine retries registration periodically.
 	pendingWatches             []schema.GroupVersionKind
@@ -336,12 +341,22 @@ func (h *eventHandler) OnUpdate(oldObj, newObj interface{}) {
 	if !ok {
 		return
 	}
-	oldCObj, _ := oldObj.(client.Object)
-	for _, p := range h.predicates {
-		if p.Update != nil && !p.Update(oldCObj, newCObj) {
-			return
+
+	// Bypass predicates when the object is being deleted and a cleanup
+	// function is registered for this GVK. Setting DeletionTimestamp does
+	// not bump metadata.generation, so WithGenerationChanged() would
+	// silently drop the event and leave the finalizer stuck.
+	isDeleting := newCObj.GetDeletionTimestamp() != nil && h.mgr.hasCleanup(h.gvk)
+
+	if !isDeleting {
+		oldCObj, _ := oldObj.(client.Object)
+		for _, p := range h.predicates {
+			if p.Update != nil && !p.Update(oldCObj, newCObj) {
+				return
+			}
 		}
 	}
+
 	h.handle(newCObj)
 }
 
@@ -365,8 +380,35 @@ func (h *eventHandler) handle(obj client.Object) {
 	nn := types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}
 	ctx := context.Background()
 
+	// If this event is for a primary resource that is being deleted and has
+	// a cleanup function registered, run cleanup and skip normal reconciliation.
+	isPrimaryForAnyReconciler := false
+	for _, r := range h.mgr.reconcilers {
+		if r.PrimaryGVK() == h.gvk {
+			isPrimaryForAnyReconciler = true
+			break
+		}
+	}
+	if !isPrimaryForAnyReconciler {
+		for _, sr := range h.mgr.statusReconcilers {
+			if sr.PrimaryGVK() == h.gvk {
+				isPrimaryForAnyReconciler = true
+				break
+			}
+		}
+	}
+
+	if isPrimaryForAnyReconciler && h.mgr.hasCleanup(h.gvk) {
+		primary := h.mgr.getPrimary(ctx, h.gvk, nn)
+		if primary != nil && primary.GetDeletionTimestamp() != nil {
+			h.mgr.runCleanup(ctx, h.gvk, nn, primary)
+			return
+		}
+	}
+
 	// Track which primaries were affected so we can run status reconcilers after.
 	affectedPrimaries := make(map[schema.GroupVersionKind]map[types.NamespacedName]bool)
+	deletingPrimaries := make(map[types.NamespacedName]bool)
 	recordAffected := func(gvk schema.GroupVersionKind, key types.NamespacedName) {
 		if affectedPrimaries[gvk] == nil {
 			affectedPrimaries[gvk] = make(map[types.NamespacedName]bool)
@@ -397,6 +439,7 @@ func (h *eventHandler) handle(obj client.Object) {
 	}
 
 	// Phase 2: run status reconcilers for affected primaries + direct deps.
+	// Skip status reconcilers for primaries that are being deleted.
 
 	// Is this a primary resource for any status reconciler?
 	for _, sr := range h.mgr.statusReconcilers {
@@ -418,6 +461,16 @@ func (h *eventHandler) handle(obj client.Object) {
 	for _, sr := range h.mgr.statusReconcilers {
 		keys := affectedPrimaries[sr.PrimaryGVK()]
 		for key := range keys {
+			if deletingPrimaries[key] {
+				continue
+			}
+			if h.mgr.hasCleanup(sr.PrimaryGVK()) {
+				primary := h.mgr.getPrimary(ctx, sr.PrimaryGVK(), key)
+				if primary != nil && primary.GetDeletionTimestamp() != nil {
+					deletingPrimaries[key] = true
+					continue
+				}
+			}
 			h.mgr.runStatusReconciler(ctx, sr, key)
 		}
 	}
@@ -425,6 +478,26 @@ func (h *eventHandler) handle(obj client.Object) {
 
 func (m *Manager) runSubReconciler(ctx context.Context, r subReconciler, primaryKey types.NamespacedName) {
 	outputKey := fmt.Sprintf("%s/%s", r.ID(), primaryKey.String())
+
+	// If a cleanup function is registered for this primary GVK, handle
+	// finalizer lifecycle: skip if deleting, add finalizer if missing.
+	if m.hasCleanup(r.PrimaryGVK()) {
+		primary := m.getPrimary(ctx, r.PrimaryGVK(), primaryKey)
+		if primary == nil {
+			return
+		}
+		if primary.GetDeletionTimestamp() != nil {
+			return
+		}
+		if !hasFinalizer(primary, m.finalizerName()) {
+			if err := addFinalizer(ctx, m.client, primary, m.finalizerName()); err != nil {
+				m.log.Error("add finalizer failed",
+					"primary", primaryKey,
+					"error", err,
+				)
+			}
+		}
+	}
 
 	desired, err := r.Reconcile(ctx, m, primaryKey)
 	if err != nil {
@@ -543,7 +616,78 @@ func (m *Manager) recordEvent(obj client.Object, eventType, reason, messageFmt s
 	m.eventRecorder.Eventf(obj, eventType, reason, messageFmt, args...)
 }
 
+func (m *Manager) finalizerName() string {
+	return "make-reconcile.io/finalizer-" + m.managerID
+}
+
+func (m *Manager) hasCleanup(gvk schema.GroupVersionKind) bool {
+	_, ok := m.cleanupFns[gvk]
+	return ok
+}
+
+// runCleanup executes the cleanup callback for a deleting primary, then removes
+// the finalizer on success. On failure the finalizer stays in place so
+// Kubernetes will re-trigger the event.
+func (m *Manager) runCleanup(ctx context.Context, gvk schema.GroupVersionKind, primaryKey types.NamespacedName, primary client.Object) {
+	ce, ok := m.cleanupFns[gvk]
+	if !ok {
+		return
+	}
+
+	hc := newHandlerContext(ctx, m, primary)
+	if err := ce.fn(hc, primary); err != nil {
+		m.log.Error("cleanup failed, finalizer retained",
+			"primary", primaryKey,
+			"error", err,
+		)
+		m.recordEvent(primary, "Warning", "CleanupFailed",
+			"Cleanup failed: %v", err)
+		return
+	}
+
+	if err := removeFinalizer(ctx, m.client, primary, m.finalizerName()); err != nil {
+		m.log.Error("remove finalizer failed",
+			"primary", primaryKey,
+			"error", err,
+		)
+		return
+	}
+
+	// Clear lastOutputs and tracker entries for this primary.
+	m.mu.Lock()
+	for key := range m.lastOutputs {
+		if strings.HasSuffix(key, "/"+primaryKey.String()) {
+			delete(m.lastOutputs, key)
+		}
+	}
+	m.mu.Unlock()
+
+	for _, r := range m.reconcilers {
+		if r.PrimaryGVK() == gvk {
+			ref := reconcilerRef{ReconcilerID: r.ID(), PrimaryKey: primaryKey}
+			m.tracker.SetDeps(ref, nil, nil)
+		}
+	}
+	for _, sr := range m.statusReconcilers {
+		if sr.PrimaryGVK() == gvk {
+			ref := reconcilerRef{ReconcilerID: sr.ID(), PrimaryKey: primaryKey}
+			m.tracker.SetDeps(ref, nil, nil)
+		}
+	}
+
+	m.recordEvent(primary, "Normal", "CleanupComplete",
+		"Cleanup complete, finalizer removed")
+}
+
 func (m *Manager) fullReconcile(ctx context.Context) {
+	// Track primaries already cleaned up to avoid running cleanup more than
+	// once when multiple reconcilers share the same primary GVK.
+	type cleanupKey struct {
+		GVK schema.GroupVersionKind
+		NN  types.NamespacedName
+	}
+	cleanedUp := make(map[cleanupKey]bool)
+
 	// Phase 1: all output reconcilers.
 	for _, r := range m.reconcilers {
 		list := newListForGVK(m.scheme, r.PrimaryGVK())
@@ -564,11 +708,22 @@ func (m *Manager) fullReconcile(ctx context.Context) {
 				continue
 			}
 			nn := types.NamespacedName{Name: cObj.GetName(), Namespace: cObj.GetNamespace()}
+
+			if cObj.GetDeletionTimestamp() != nil && m.hasCleanup(r.PrimaryGVK()) {
+				ck := cleanupKey{GVK: r.PrimaryGVK(), NN: nn}
+				if !cleanedUp[ck] {
+					m.runCleanup(ctx, r.PrimaryGVK(), nn, cObj)
+					cleanedUp[ck] = true
+				}
+				continue
+			}
+
 			m.runSubReconciler(ctx, r, nn)
 		}
 	}
 
 	// Phase 2: all status reconcilers (after outputs are applied).
+	// Skip primaries that are being deleted.
 	for _, sr := range m.statusReconcilers {
 		list := newListForGVK(m.scheme, sr.PrimaryGVK())
 		if err := m.cache.List(ctx, list); err != nil {
@@ -585,6 +740,9 @@ func (m *Manager) fullReconcile(ctx context.Context) {
 		for _, item := range items {
 			cObj, ok := item.(client.Object)
 			if !ok {
+				continue
+			}
+			if cObj.GetDeletionTimestamp() != nil && m.hasCleanup(sr.PrimaryGVK()) {
 				continue
 			}
 			nn := types.NamespacedName{Name: cObj.GetName(), Namespace: cObj.GetNamespace()}

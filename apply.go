@@ -123,6 +123,43 @@ func applyStatus(ctx context.Context, c client.Client, gvk schema.GroupVersionKi
 	)
 }
 
+// addFinalizer adds the named finalizer to obj via merge patch. No-op if
+// the finalizer is already present.
+func addFinalizer(ctx context.Context, c client.Client, obj client.Object, finalizer string) error {
+	if hasFinalizer(obj, finalizer) {
+		return nil
+	}
+	base := obj.DeepCopyObject().(client.Object)
+	obj.SetFinalizers(append(obj.GetFinalizers(), finalizer))
+	return c.Patch(ctx, obj, client.MergeFrom(base))
+}
+
+// removeFinalizer removes the named finalizer from obj via merge patch.
+// No-op if the finalizer is not present.
+func removeFinalizer(ctx context.Context, c client.Client, obj client.Object, finalizer string) error {
+	if !hasFinalizer(obj, finalizer) {
+		return nil
+	}
+	base := obj.DeepCopyObject().(client.Object)
+	var remaining []string
+	for _, f := range obj.GetFinalizers() {
+		if f != finalizer {
+			remaining = append(remaining, f)
+		}
+	}
+	obj.SetFinalizers(remaining)
+	return c.Patch(ctx, obj, client.MergeFrom(base))
+}
+
+func hasFinalizer(obj client.Object, finalizer string) bool {
+	for _, f := range obj.GetFinalizers() {
+		if f == finalizer {
+			return true
+		}
+	}
+	return false
+}
+
 func isNotFound(err error) bool {
 	// apimachinery errors implement StatusError with a reason.
 	type statusErr interface {

@@ -213,9 +213,11 @@ func (s *ObjectStore) DeleteAllOf(_ context.Context, _ client.Object, _ ...clien
 	return fmt.Errorf("not implemented")
 }
 
-func (s *ObjectStore) Patch(_ context.Context, obj client.Object, _ client.Patch, _ ...client.PatchOption) error {
+func (s *ObjectStore) Patch(_ context.Context, obj client.Object, patch client.Patch, _ ...client.PatchOption) error {
 	s.mu.Lock()
-	s.Applied = append(s.Applied, obj)
+	if patch.Type() == types.ApplyPatchType {
+		s.Applied = append(s.Applied, obj)
+	}
 	gvk := s.resolveGVK(obj)
 	nn := types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}
 	s.objects[objectKey{GVK: gvk, Key: nn}] = obj.DeepCopyObject().(client.Object)
