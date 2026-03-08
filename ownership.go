@@ -20,17 +20,15 @@ const (
 // ownershipStrategy controls how output resources are linked to their primary
 // resources. Selected at Manager construction time.
 type ownershipStrategy interface {
-	// prepareDesired mutates the desired object before SSA apply
-	// (e.g., set OwnerReference for ownerRef strategy, no-op for annotation).
-	prepareDesired(desired client.Object, ownerGVK schema.GroupVersionKind,
-		ownerRef types.NamespacedName, ownerUID types.UID, managerID string)
-
-	// applyOwnership performs post-apply bookkeeping. For annotation strategy,
-	// this adds the primary to the contributor list on the output resource.
-	applyOwnership(ctx context.Context, c client.Client, scheme *runtime.Scheme,
-		outputGVK schema.GroupVersionKind, outputNN types.NamespacedName,
+	// prepareDesired mutates the desired object before SSA apply. For ownerRef
+	// strategy this sets OwnerReferences. For annotation strategy this reads
+	// existing contributors from the live object and merges the current primary
+	// into the contributor annotation on the desired object, so the SSA apply
+	// preserves all contributors.
+	prepareDesired(ctx context.Context, c client.Client, scheme *runtime.Scheme,
+		desired client.Object, outputGVK schema.GroupVersionKind,
 		ownerGVK schema.GroupVersionKind, ownerRef types.NamespacedName,
-		managerID string) error
+		ownerUID types.UID, managerID string)
 
 	// releaseOwnership removes this primary's claim from the output. Returns
 	// shouldDelete=true if no owners remain and the resource should be deleted.
@@ -48,15 +46,11 @@ type ownershipStrategy interface {
 // relies on Kubernetes GC for cleanup on primary deletion.
 type ownerRefStrategy struct{}
 
-func (s *ownerRefStrategy) prepareDesired(desired client.Object, ownerGVK schema.GroupVersionKind,
-	ownerRef types.NamespacedName, ownerUID types.UID, _ string) {
+func (s *ownerRefStrategy) prepareDesired(_ context.Context, _ client.Client, _ *runtime.Scheme,
+	desired client.Object, _ schema.GroupVersionKind,
+	ownerGVK schema.GroupVersionKind, ownerRef types.NamespacedName,
+	ownerUID types.UID, _ string) {
 	setOwnerRef(desired, ownerGVK, ownerRef, ownerUID)
-}
-
-func (s *ownerRefStrategy) applyOwnership(_ context.Context, _ client.Client, _ *runtime.Scheme,
-	_ schema.GroupVersionKind, _ types.NamespacedName,
-	_ schema.GroupVersionKind, _ types.NamespacedName, _ string) error {
-	return nil
 }
 
 func (s *ownerRefStrategy) releaseOwnership(_ context.Context, _ client.Client, _ *runtime.Scheme,
@@ -72,21 +66,36 @@ func (s *ownerRefStrategy) needsFinalizer() bool { return false }
 // the last contributor is removed.
 type annotationStrategy struct{}
 
-func (s *annotationStrategy) prepareDesired(_ client.Object, _ schema.GroupVersionKind,
-	_ types.NamespacedName, _ types.UID, _ string) {
-	// No OwnerReference — lifecycle is managed via contributor annotation.
-}
-
-func (s *annotationStrategy) applyOwnership(ctx context.Context, c client.Client, scheme *runtime.Scheme,
-	outputGVK schema.GroupVersionKind, outputNN types.NamespacedName,
+func (s *annotationStrategy) prepareDesired(ctx context.Context, c client.Client, scheme *runtime.Scheme,
+	desired client.Object, outputGVK schema.GroupVersionKind,
 	ownerGVK schema.GroupVersionKind, ownerRef types.NamespacedName,
-	_ string) error {
-	obj, err := newObjectForGVK(scheme, outputGVK, outputNN)
-	if err != nil {
-		return err
-	}
+	_ types.UID, _ string) {
+	// Read existing contributors from the live object (if it exists) and merge
+	// the current primary. This ensures the SSA apply preserves all contributors.
 	contributor := contributorKey(ownerGVK, ownerRef)
-	return addContributor(ctx, c, obj, contributor)
+
+	live, err := newObjectForGVK(scheme, outputGVK,
+		types.NamespacedName{Name: desired.GetName(), Namespace: desired.GetNamespace()})
+	if err == nil && c != nil {
+		if getErr := c.Get(ctx, client.ObjectKeyFromObject(live), live); getErr == nil {
+			contributors := getContributors(live)
+			found := false
+			for _, existing := range contributors {
+				if existing == contributor {
+					found = true
+					break
+				}
+			}
+			if !found {
+				contributors = append(contributors, contributor)
+			}
+			setContributors(desired, contributors)
+			return
+		}
+	}
+
+	// Object doesn't exist yet — set this primary as the sole contributor.
+	setContributors(desired, []string{contributor})
 }
 
 func (s *annotationStrategy) releaseOwnership(ctx context.Context, c client.Client, scheme *runtime.Scheme,
@@ -151,37 +160,6 @@ func setContributors(obj client.Object, contributors []string) {
 		annotations[contributorAnnotation] = string(data)
 	}
 	obj.SetAnnotations(annotations)
-}
-
-// addContributor adds a contributor to the annotation on the object via
-// read-modify-write with optimistic retry on conflict.
-func addContributor(ctx context.Context, c client.Client, obj client.Object, contributor string) error {
-	for attempt := 0; attempt < maxConflictRetries; attempt++ {
-		if err := c.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
-			return fmt.Errorf("get for contributor update: %w", err)
-		}
-
-		contributors := getContributors(obj)
-		for _, existing := range contributors {
-			if existing == contributor {
-				return nil
-			}
-		}
-
-		base := obj.DeepCopyObject().(client.Object)
-		contributors = append(contributors, contributor)
-		setContributors(obj, contributors)
-
-		err := c.Patch(ctx, obj, client.MergeFrom(base))
-		if err == nil {
-			return nil
-		}
-		if isConflict(err) {
-			continue
-		}
-		return fmt.Errorf("patch contributor annotation: %w", err)
-	}
-	return fmt.Errorf("add contributor: exceeded %d conflict retries", maxConflictRetries)
 }
 
 // removeContributor removes a contributor from the annotation. Returns true if

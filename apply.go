@@ -19,24 +19,18 @@ const (
 )
 
 // applyDesired uses server-side apply to create or update the desired resource.
-// It delegates to the ownership strategy for setting owner references (or not)
-// and for post-apply bookkeeping (e.g., contributor annotation updates).
-// The managed-by label is always set for orphan garbage collection.
+// It delegates to the ownership strategy for setting owner references or
+// contributor annotations before the SSA apply. The managed-by label is always
+// set for orphan garbage collection.
 func applyDesired(ctx context.Context, c client.Client, scheme *runtime.Scheme, desired client.Object, outputGVK schema.GroupVersionKind, ownerGVK schema.GroupVersionKind, ownerRef types.NamespacedName, ownerUID types.UID, managerID string, ownership ownershipStrategy) error {
-	ownership.prepareDesired(desired, ownerGVK, ownerRef, ownerUID, managerID)
+	ownership.prepareDesired(ctx, c, scheme, desired, outputGVK, ownerGVK, ownerRef, ownerUID, managerID)
 	setManagedByLabel(desired, managerID)
-
-	outputNN := types.NamespacedName{Name: desired.GetName(), Namespace: desired.GetNamespace()}
 
 	opts := []client.PatchOption{
 		client.ForceOwnership,
 		client.FieldOwner(fieldManager),
 	}
-	if err := c.Patch(ctx, desired, client.Apply, opts...); err != nil {
-		return err
-	}
-
-	return ownership.applyOwnership(ctx, c, scheme, outputGVK, outputNN, ownerGVK, ownerRef, managerID)
+	return c.Patch(ctx, desired, client.Apply, opts...)
 }
 
 func setManagedByLabel(obj client.Object, managerID string) {
