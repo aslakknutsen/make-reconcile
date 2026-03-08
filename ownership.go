@@ -70,14 +70,14 @@ func (s *annotationStrategy) prepareDesired(ctx context.Context, c client.Client
 	desired client.Object, outputGVK schema.GroupVersionKind,
 	ownerGVK schema.GroupVersionKind, ownerRef types.NamespacedName,
 	_ types.UID, _ string) {
-	// Read existing contributors from the live object (if it exists) and merge
-	// the current primary. This ensures the SSA apply preserves all contributors.
 	contributor := contributorKey(ownerGVK, ownerRef)
 
 	live, err := newObjectForGVK(scheme, outputGVK,
 		types.NamespacedName{Name: desired.GetName(), Namespace: desired.GetNamespace()})
 	if err == nil && c != nil {
-		if getErr := c.Get(ctx, client.ObjectKeyFromObject(live), live); getErr == nil {
+		getErr := c.Get(ctx, client.ObjectKeyFromObject(live), live)
+		switch {
+		case getErr == nil:
 			contributors := getContributors(live)
 			found := false
 			for _, existing := range contributors {
@@ -91,10 +91,16 @@ func (s *annotationStrategy) prepareDesired(ctx context.Context, c client.Client
 			}
 			setContributors(desired, contributors)
 			return
+		case isNotFound(getErr):
+			// Object doesn't exist yet — fall through to sole contributor.
+		default:
+			// Transient error (timeout, network). Don't overwrite the annotation
+			// with a single contributor — leave it unset so the apply either
+			// fails or preserves whatever is on the server.
+			return
 		}
 	}
 
-	// Object doesn't exist yet — set this primary as the sole contributor.
 	setContributors(desired, []string{contributor})
 }
 
@@ -113,9 +119,10 @@ func (s *annotationStrategy) releaseOwnership(ctx context.Context, c client.Clie
 func (s *annotationStrategy) needsFinalizer() bool { return true }
 
 // contributorKey returns a stable identifier for a contributing primary:
-// "Kind/Namespace/Name". Unique within a single manager.
+// "Group/Kind/Namespace/Name". Group is included to avoid collisions when
+// different API groups define the same Kind.
 func contributorKey(gvk schema.GroupVersionKind, nn types.NamespacedName) string {
-	return fmt.Sprintf("%s/%s/%s", gvk.Kind, nn.Namespace, nn.Name)
+	return fmt.Sprintf("%s/%s/%s/%s", gvk.Group, gvk.Kind, nn.Namespace, nn.Name)
 }
 
 func newObjectForGVK(scheme *runtime.Scheme, gvk schema.GroupVersionKind, nn types.NamespacedName) (client.Object, error) {

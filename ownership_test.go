@@ -13,7 +13,7 @@ func TestContributorKeyFormat(t *testing.T) {
 	gvk := schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Session"}
 	nn := types.NamespacedName{Name: "session-a", Namespace: "default"}
 	got := contributorKey(gvk, nn)
-	want := "Session/default/session-a"
+	want := "/Session/default/session-a"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
@@ -30,9 +30,9 @@ func TestGetSetContributors(t *testing.T) {
 	}
 
 	// Set some.
-	setContributors(obj, []string{"Session/default/a", "Session/default/b"})
+	setContributors(obj, []string{"/Session/default/a", "/Session/default/b"})
 	got := getContributors(obj)
-	if len(got) != 2 || got[0] != "Session/default/a" || got[1] != "Session/default/b" {
+	if len(got) != 2 || got[0] != "/Session/default/a" || got[1] != "/Session/default/b" {
 		t.Errorf("unexpected contributors: %v", got)
 	}
 

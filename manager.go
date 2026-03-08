@@ -758,6 +758,8 @@ func (m *Manager) releaseAllOutputs(ctx context.Context, primaryGVK schema.Group
 				return fmt.Errorf("release ownership on %s %s: %w", r.OutputGVK().Kind, nn, err)
 			}
 			if shouldDelete {
+				// Delete errors are logged but don't block finalizer removal.
+				// gcOrphans will clean up any resources that survive this.
 				if err := deleteIfExists(ctx, m.client, m.scheme, r.OutputGVK(), nn); err != nil {
 					m.log.Error("delete output after release failed",
 						"reconciler", r.ID(),

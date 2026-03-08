@@ -1,11 +1,11 @@
 package mrtest_test
 
 import (
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 
 	mr "github.com/aslakknutsen/make-reconcile"
@@ -45,7 +45,7 @@ func TestAnnotationOwnershipAddsContributorOnApply(t *testing.T) {
 	if !ok {
 		t.Fatal("expected contributor annotation")
 	}
-	if raw != `["ConfigMap/default/primary-a"]` {
+	if raw != `["/ConfigMap/default/primary-a"]` {
 		t.Errorf("unexpected contributor annotation: %s", raw)
 	}
 }
@@ -103,7 +103,7 @@ func TestAnnotationOwnershipTwoPrimariesSameOutput(t *testing.T) {
 	ann := svc.GetAnnotations()
 	raw := ann["make-reconcile.io/contributors"]
 	// Both contributors should be listed.
-	if raw != `["ConfigMap/default/primary-a","ConfigMap/default/primary-b"]` {
+	if raw != `["/ConfigMap/default/primary-a","/ConfigMap/default/primary-b"]` {
 		t.Errorf("unexpected contributors: %s", raw)
 	}
 }
@@ -150,7 +150,7 @@ func TestAnnotationOwnershipDeleteOnePrimaryLeavesOutput(t *testing.T) {
 
 	ann := svc.GetAnnotations()
 	raw := ann["make-reconcile.io/contributors"]
-	if raw != `["ConfigMap/default/primary-b"]` {
+	if raw != `["/ConfigMap/default/primary-b"]` {
 		t.Errorf("expected only primary-b contributor, got %s", raw)
 	}
 }
@@ -309,7 +309,7 @@ func TestAnnotationOwnershipStaleOutputRelease(t *testing.T) {
 	}
 	ann := svc.GetAnnotations()
 	raw := ann["make-reconcile.io/contributors"]
-	if raw != `["ConfigMap/default/primary-b"]` {
+	if raw != `["/ConfigMap/default/primary-b"]` {
 		t.Errorf("expected only primary-b contributor, got %s", raw)
 	}
 }
@@ -347,22 +347,14 @@ func TestAnnotationOwnershipSettleWithMultiplePrimaries(t *testing.T) {
 	containsA := false
 	containsB := false
 	if len(raw) > 0 {
-		containsA = contains(raw, "ConfigMap/default/a")
-		containsB = contains(raw, "ConfigMap/default/b")
+		containsA = strings.Contains(raw, "/ConfigMap/default/a")
+		containsB = strings.Contains(raw, "/ConfigMap/default/b")
 	}
 	if !containsA || !containsB {
 		t.Errorf("expected both contributors, got %s", raw)
 	}
 }
 
-func contains(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
 
 // Verify that ownerRef strategy (default) is unchanged.
 func TestDefaultOwnerRefStrategyStillWorks(t *testing.T) {
