@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -104,7 +105,7 @@ func (s *ObjectStore) Get(_ context.Context, key client.ObjectKey, obj client.Ob
 	stored, ok := s.objects[objectKey{GVK: gvk, Key: key}]
 	s.mu.RUnlock()
 	if !ok {
-		return fmt.Errorf("not found: %v %v", gvk, key)
+		return &notFoundError{gvk: gvk, key: key}
 	}
 	src := reflect.ValueOf(stored)
 	dst := reflect.ValueOf(obj)
@@ -254,4 +255,23 @@ func (w *storeStatusWriter) Patch(_ context.Context, obj client.Object, _ client
 
 func (w *storeStatusWriter) Apply(_ context.Context, _ runtime.ApplyConfiguration, _ ...client.SubResourceApplyOption) error {
 	return nil
+}
+
+// notFoundError implements the statusErr interface expected by isNotFound
+// in the main package, so annotation-based ownership can detect not-found
+// resources during contributor removal.
+type notFoundError struct {
+	gvk schema.GroupVersionKind
+	key types.NamespacedName
+}
+
+func (e *notFoundError) Error() string {
+	return fmt.Sprintf("not found: %v %v", e.gvk, e.key)
+}
+
+func (e *notFoundError) Status() metav1.Status {
+	return metav1.Status{
+		Reason:  metav1.StatusReasonNotFound,
+		Message: e.Error(),
+	}
 }

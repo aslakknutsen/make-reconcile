@@ -25,15 +25,19 @@ type TestHarness struct {
 
 // NewHarness creates a TestHarness backed by an in-memory ObjectStore.
 // Pass the returned Manager() to Watch/Reconcile/RegisterAll calls.
-func NewHarness(t *testing.T, scheme *runtime.Scheme) *TestHarness {
+// Additional ManagerOptions (e.g. WithAnnotationOwnership) are forwarded
+// to the underlying Manager.
+func NewHarness(t *testing.T, scheme *runtime.Scheme, opts ...mr.ManagerOption) *TestHarness {
 	t.Helper()
 	store := NewObjectStore(scheme)
 	rec := &EventRecorder{}
-	mgr := mr.NewManagerForTest(scheme,
+	mgrOpts := []mr.ManagerOption{
 		mr.WithCache(store),
 		mr.WithClient(store),
 		mr.WithEventRecorder(rec),
-	)
+	}
+	mgrOpts = append(mgrOpts, opts...)
+	mgr := mr.NewManagerForTest(scheme, mgrOpts...)
 	return &TestHarness{
 		t:        t,
 		mgr:      mgr,
