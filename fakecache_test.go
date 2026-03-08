@@ -114,6 +114,7 @@ func (fi *fakeInformer) IsStopped() bool                        { return false }
 // Used by internal tests that need features like statusPatchErr injection.
 type fakeClient struct {
 	client.Client
+	patches        int
 	statusPatches  int
 	statusPatchErr error
 
@@ -122,6 +123,7 @@ type fakeClient struct {
 }
 
 func (f *fakeClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	f.patches++
 	return nil
 }
 

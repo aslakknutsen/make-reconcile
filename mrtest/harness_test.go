@@ -589,3 +589,233 @@ func TestMultipleReconcilersSameOutputGVK(t *testing.T) {
 	result.AssertApplied("svc-app", "default")
 	result.AssertApplied("svc-worker", "default")
 }
+
+// --- OnDelete / finalizer tests ---
+
+func TestOnDeleteFinalizerAddedOnReconcile(t *testing.T) {
+	h := mrtest.NewHarness(t, testScheme())
+	mgr := h.Manager()
+
+	configMaps := mr.Watch[*corev1.ConfigMap](mgr)
+	mr.OnDelete(mgr, configMaps, func(hc *mr.HandlerContext, cm *corev1.ConfigMap) error {
+		return nil
+	})
+
+	mr.Reconcile(mgr, configMaps, func(hc *mr.HandlerContext, cm *corev1.ConfigMap) *appsv1.Deployment {
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: cm.Name + "-deploy", Namespace: cm.Namespace},
+		}
+	})
+
+	h.SetObject(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "default", UID: "uid-1"},
+	})
+
+	result := h.Reconcile(cmGVK, types.NamespacedName{Name: "app", Namespace: "default"})
+	result.AssertApplied("app-deploy", "default")
+
+	// Verify the finalizer was added to the primary in the store.
+	cm := mrtest.GetObject[*corev1.ConfigMap](h, "app", "default")
+	if cm == nil {
+		t.Fatal("expected ConfigMap in store")
+	}
+	found := false
+	for _, f := range cm.GetFinalizers() {
+		if f == "make-reconcile.io/finalizer-default" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected finalizer on ConfigMap, got finalizers: %v", cm.GetFinalizers())
+	}
+}
+
+func TestOnDeleteCleanupRunsOnDeletion(t *testing.T) {
+	h := mrtest.NewHarness(t, testScheme())
+	mgr := h.Manager()
+
+	configMaps := mr.Watch[*corev1.ConfigMap](mgr)
+
+	var cleanupCalled bool
+	mr.OnDelete(mgr, configMaps, func(hc *mr.HandlerContext, cm *corev1.ConfigMap) error {
+		cleanupCalled = true
+		return nil
+	})
+
+	mr.Reconcile(mgr, configMaps, func(hc *mr.HandlerContext, cm *corev1.ConfigMap) *appsv1.Deployment {
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: cm.Name + "-deploy", Namespace: cm.Namespace},
+		}
+	})
+
+	// First reconcile: adds finalizer.
+	h.SetObject(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "default", UID: "uid-1"},
+	})
+	h.Reconcile(cmGVK, types.NamespacedName{Name: "app", Namespace: "default"})
+
+	// Simulate deletion: set DeletionTimestamp and keep the finalizer.
+	now := metav1.Now()
+	h.SetObject(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "app", Namespace: "default", UID: "uid-1",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{"make-reconcile.io/finalizer-default"},
+		},
+	})
+	result := h.Reconcile(cmGVK, types.NamespacedName{Name: "app", Namespace: "default"})
+
+	if !cleanupCalled {
+		t.Error("expected cleanup to be called on deletion")
+	}
+
+	// Output should not have been applied (cleanup path, not normal reconcile).
+	result.AssertAppliedCount(0)
+
+	// Finalizer should have been removed.
+	cm := mrtest.GetObject[*corev1.ConfigMap](h, "app", "default")
+	if cm != nil {
+		for _, f := range cm.GetFinalizers() {
+			if f == "make-reconcile.io/finalizer-default" {
+				t.Error("finalizer should have been removed after cleanup")
+			}
+		}
+	}
+}
+
+func TestOnDeleteCleanupCanFetchResources(t *testing.T) {
+	h := mrtest.NewHarness(t, testScheme())
+	mgr := h.Manager()
+
+	configMaps := mr.Watch[*corev1.ConfigMap](mgr)
+	secrets := mr.Watch[*corev1.Secret](mgr)
+
+	var fetchedSecretName string
+	mr.OnDelete(mgr, configMaps, func(hc *mr.HandlerContext, cm *corev1.ConfigMap) error {
+		sec := mr.Fetch(hc, secrets, mr.FilterName(cm.Name+"-secret", cm.Namespace))
+		if sec != nil {
+			fetchedSecretName = sec.Name
+		}
+		return nil
+	})
+
+	mr.Reconcile(mgr, configMaps, func(hc *mr.HandlerContext, cm *corev1.ConfigMap) *appsv1.Deployment {
+		return nil
+	})
+
+	now := metav1.Now()
+	h.SetObject(
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "app", Namespace: "default", UID: "uid-1",
+				DeletionTimestamp: &now,
+				Finalizers:        []string{"make-reconcile.io/finalizer-default"},
+			},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "app-secret", Namespace: "default"},
+		},
+	)
+
+	h.Reconcile(cmGVK, types.NamespacedName{Name: "app", Namespace: "default"})
+
+	if fetchedSecretName != "app-secret" {
+		t.Errorf("expected cleanup to fetch 'app-secret', got %q", fetchedSecretName)
+	}
+}
+
+func TestOnDeleteStatusSkippedDuringDeletion(t *testing.T) {
+	h := mrtest.NewHarness(t, testScheme())
+	mgr := h.Manager()
+
+	configMaps := mr.Watch[*corev1.ConfigMap](mgr)
+
+	mr.OnDelete(mgr, configMaps, func(hc *mr.HandlerContext, cm *corev1.ConfigMap) error {
+		return nil
+	})
+
+	mr.Reconcile(mgr, configMaps, func(hc *mr.HandlerContext, cm *corev1.ConfigMap) *appsv1.Deployment {
+		return nil
+	})
+
+	type status struct {
+		Done bool `json:"done"`
+	}
+	var statusInvoked bool
+	mr.ReconcileStatus(mgr, configMaps, func(hc *mr.HandlerContext, cm *corev1.ConfigMap) *status {
+		statusInvoked = true
+		return &status{Done: true}
+	})
+
+	now := metav1.Now()
+	h.SetObject(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "app", Namespace: "default", UID: "uid-1",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{"make-reconcile.io/finalizer-default"},
+		},
+	})
+
+	h.Reconcile(cmGVK, types.NamespacedName{Name: "app", Namespace: "default"})
+
+	if statusInvoked {
+		t.Error("status reconciler should not run during deletion")
+	}
+}
+
+func TestSettleHandlesDeletingPrimaries(t *testing.T) {
+	h := mrtest.NewHarness(t, testScheme())
+	mgr := h.Manager()
+
+	configMaps := mr.Watch[*corev1.ConfigMap](mgr)
+
+	var cleanupNames []string
+	var reconcileNames []string
+
+	mr.OnDelete(mgr, configMaps, func(hc *mr.HandlerContext, cm *corev1.ConfigMap) error {
+		cleanupNames = append(cleanupNames, cm.Name)
+		return nil
+	})
+
+	mr.Reconcile(mgr, configMaps, func(hc *mr.HandlerContext, cm *corev1.ConfigMap) *appsv1.Deployment {
+		reconcileNames = append(reconcileNames, cm.Name)
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: cm.Name + "-deploy", Namespace: cm.Namespace},
+		}
+	})
+
+	now := metav1.Now()
+	h.SetObject(
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "alive", Namespace: "default", UID: "uid-1",
+			},
+		},
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "dying", Namespace: "default", UID: "uid-2",
+				DeletionTimestamp: &now,
+				Finalizers:        []string{"make-reconcile.io/finalizer-default"},
+			},
+		},
+	)
+
+	h.Settle()
+
+	if len(cleanupNames) != 1 || cleanupNames[0] != "dying" {
+		t.Errorf("expected cleanup for 'dying' only, got %v", cleanupNames)
+	}
+
+	foundAlive := false
+	for _, n := range reconcileNames {
+		if n == "alive" {
+			foundAlive = true
+		}
+		if n == "dying" {
+			t.Error("'dying' should not have been reconciled normally")
+		}
+	}
+	if !foundAlive {
+		t.Error("expected 'alive' to be reconciled normally")
+	}
+}
