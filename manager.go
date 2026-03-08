@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -905,7 +906,7 @@ func (m *Manager) releaseAllOutputs(ctx context.Context, primaryGVK schema.Group
 		}
 		outputKey := fmt.Sprintf("%s/%s", r.ID(), primaryKey.String())
 		m.mu.Lock()
-		outputNNs := m.lastOutputs[outputKey]
+		outputNNs := maps.Clone(m.lastOutputs[outputKey])
 		m.mu.Unlock()
 
 		for nn := range outputNNs {
@@ -939,7 +940,7 @@ func (m *Manager) revertAllPatches(ctx context.Context, primaryGVK schema.GroupV
 		}
 		pk := fmt.Sprintf("%s/%s", r.ID(), primaryKey.String())
 		m.mu.Lock()
-		targetNNs := m.lastPatches[pk]
+		targetNNs := maps.Clone(m.lastPatches[pk])
 		m.mu.Unlock()
 
 		pid := patchID(m.managerID, r.ID(), primaryKey)
