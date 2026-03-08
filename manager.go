@@ -48,6 +48,10 @@ type Manager struct {
 	// when the set of outputs shrinks.
 	lastOutputs map[string]map[types.NamespacedName]bool
 
+	// ownership controls how output resources are linked to primaries.
+	// Default is ownerRefStrategy (OwnerReferences + Kubernetes GC).
+	ownership ownershipStrategy
+
 	// cleanupFns maps a primary GVK to its registered cleanup function.
 	// Registered via OnDelete. When the primary is being deleted (finalizer
 	// pending), the cleanup function runs instead of normal reconciliation.
@@ -91,6 +95,19 @@ func WithPendingWatchRetryInterval(d time.Duration) ManagerOption {
 // Reconciler functions can also emit custom events via HandlerContext.RecordEvent.
 func WithEventRecorder(recorder record.EventRecorder) ManagerOption {
 	return func(m *Manager) { m.eventRecorder = recorder }
+}
+
+// WithAnnotationOwnership switches the Manager to annotation-based multi-owner
+// tracking. Instead of setting OwnerReferences on output resources, the
+// framework maintains a contributor list in an annotation. The output is only
+// deleted when the last contributor is removed.
+//
+// This strategy requires finalizers for cleanup on primary deletion (the
+// framework adds them automatically). It composes with OnDelete callbacks.
+//
+// Mixed strategies require two Managers (already supported via WithManagerID).
+func WithAnnotationOwnership() ManagerOption {
+	return func(m *Manager) { m.ownership = &annotationStrategy{} }
 }
 
 // WithCache sets the cache implementation. Intended for testing.
@@ -137,6 +154,7 @@ func NewManager(cfg *rest.Config, scheme *runtime.Scheme, opts ...ManagerOption)
 		resyncPeriod:    5 * time.Minute,
 		managerID:       "default",
 		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
+		ownership:       &ownerRefStrategy{},
 	}
 	for _, o := range opts {
 		o(m)
@@ -158,6 +176,7 @@ func NewManagerForTest(scheme *runtime.Scheme, opts ...ManagerOption) *Manager {
 		resyncPeriod:    5 * time.Minute,
 		managerID:       "default",
 		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
+		ownership:       &ownerRefStrategy{},
 	}
 	for _, o := range opts {
 		o(m)
@@ -346,7 +365,7 @@ func (h *eventHandler) OnUpdate(oldObj, newObj interface{}) {
 	// function is registered for this GVK. Setting DeletionTimestamp does
 	// not bump metadata.generation, so WithGenerationChanged() would
 	// silently drop the event and leave the finalizer stuck.
-	isDeleting := newCObj.GetDeletionTimestamp() != nil && h.mgr.hasCleanup(h.gvk)
+	isDeleting := newCObj.GetDeletionTimestamp() != nil && h.mgr.needsFinalizer(h.gvk)
 
 	if !isDeleting {
 		oldCObj, _ := oldObj.(client.Object)
@@ -398,7 +417,7 @@ func (h *eventHandler) handle(obj client.Object) {
 		}
 	}
 
-	if isPrimaryForAnyReconciler && h.mgr.hasCleanup(h.gvk) {
+	if isPrimaryForAnyReconciler && h.mgr.needsFinalizer(h.gvk) {
 		primary := h.mgr.getPrimary(ctx, h.gvk, nn)
 		if primary != nil && primary.GetDeletionTimestamp() != nil {
 			h.mgr.runCleanup(ctx, h.gvk, nn, primary)
@@ -464,7 +483,7 @@ func (h *eventHandler) handle(obj client.Object) {
 			if deletingPrimaries[key] {
 				continue
 			}
-			if h.mgr.hasCleanup(sr.PrimaryGVK()) {
+			if h.mgr.needsFinalizer(sr.PrimaryGVK()) {
 				primary := h.mgr.getPrimary(ctx, sr.PrimaryGVK(), key)
 				if primary != nil && primary.GetDeletionTimestamp() != nil {
 					deletingPrimaries[key] = true
@@ -481,7 +500,7 @@ func (m *Manager) runSubReconciler(ctx context.Context, r subReconciler, primary
 
 	// If a cleanup function is registered for this primary GVK, handle
 	// finalizer lifecycle: skip if deleting, add finalizer if missing.
-	if m.hasCleanup(r.PrimaryGVK()) {
+	if m.needsFinalizer(r.PrimaryGVK()) {
 		primary := m.getPrimary(ctx, r.PrimaryGVK(), primaryKey)
 		if primary == nil {
 			return
@@ -528,7 +547,7 @@ func (m *Manager) runSubReconciler(ctx context.Context, r subReconciler, primary
 		if primaryObj != nil {
 			uid = primaryObj.GetUID()
 		}
-		if err := applyDesired(ctx, m.client, obj, r.PrimaryGVK(), primaryKey, uid, m.managerID); err != nil {
+		if err := applyDesired(ctx, m.client, m.scheme, obj, r.OutputGVK(), r.PrimaryGVK(), primaryKey, uid, m.managerID, m.getOwnership()); err != nil {
 			m.log.Error("apply failed",
 				"reconciler", r.ID(),
 				"resource", onn,
@@ -561,19 +580,31 @@ func (m *Manager) runSubReconciler(ctx context.Context, r subReconciler, primary
 
 	for prev := range prevKeys {
 		if !wantKeys[prev] {
-			if err := deleteIfExists(ctx, m.client, m.scheme, r.OutputGVK(), prev); err != nil {
-				m.log.Error("delete stale output failed",
+			shouldDelete, err := m.getOwnership().releaseOwnership(ctx, m.client, m.scheme,
+				r.OutputGVK(), prev, r.PrimaryGVK(), primaryKey, m.managerID)
+			if err != nil {
+				m.log.Error("release ownership failed",
 					"reconciler", r.ID(),
 					"resource", prev,
 					"error", err,
 				)
-				m.recordEvent(m.getPrimary(ctx, r.PrimaryGVK(), primaryKey),
-					"Warning", "DeleteFailed",
-					"Failed to delete stale %s %s: %v", r.OutputGVK().Kind, prev, err)
-			} else {
-				m.recordEvent(m.getPrimary(ctx, r.PrimaryGVK(), primaryKey),
-					"Normal", "Deleted",
-					"Deleted stale %s %s", r.OutputGVK().Kind, prev)
+				continue
+			}
+			if shouldDelete {
+				if err := deleteIfExists(ctx, m.client, m.scheme, r.OutputGVK(), prev); err != nil {
+					m.log.Error("delete stale output failed",
+						"reconciler", r.ID(),
+						"resource", prev,
+						"error", err,
+					)
+					m.recordEvent(m.getPrimary(ctx, r.PrimaryGVK(), primaryKey),
+						"Warning", "DeleteFailed",
+						"Failed to delete stale %s %s: %v", r.OutputGVK().Kind, prev, err)
+				} else {
+					m.recordEvent(m.getPrimary(ctx, r.PrimaryGVK(), primaryKey),
+						"Normal", "Deleted",
+						"Deleted stale %s %s", r.OutputGVK().Kind, prev)
+				}
 			}
 		}
 	}
@@ -625,24 +656,52 @@ func (m *Manager) hasCleanup(gvk schema.GroupVersionKind) bool {
 	return ok
 }
 
-// runCleanup executes the cleanup callback for a deleting primary, then removes
-// the finalizer on success. On failure the finalizer stays in place so
+// getOwnership returns the ownership strategy, defaulting to ownerRefStrategy
+// when none is set (e.g., in test Manager literals that omit the field).
+func (m *Manager) getOwnership() ownershipStrategy {
+	if m.ownership == nil {
+		return &ownerRefStrategy{}
+	}
+	return m.ownership
+}
+
+// needsFinalizer returns true if a finalizer is needed for the given primary
+// GVK — either because the user registered an OnDelete callback or because
+// the ownership strategy requires finalizer-based cleanup (annotation strategy).
+func (m *Manager) needsFinalizer(gvk schema.GroupVersionKind) bool {
+	return m.hasCleanup(gvk) || m.getOwnership().needsFinalizer()
+}
+
+// runCleanup handles primary deletion: releases ownership on outputs,
+// executes the user cleanup callback (if registered), removes the finalizer,
+// and clears internal state. On failure the finalizer stays in place so
 // Kubernetes will re-trigger the event.
 func (m *Manager) runCleanup(ctx context.Context, gvk schema.GroupVersionKind, primaryKey types.NamespacedName, primary client.Object) {
-	ce, ok := m.cleanupFns[gvk]
-	if !ok {
-		return
+	// Release annotation-based ownership on all outputs for this primary.
+	if m.getOwnership().needsFinalizer() {
+		if err := m.releaseAllOutputs(ctx, gvk, primaryKey); err != nil {
+			m.log.Error("release outputs failed, finalizer retained",
+				"primary", primaryKey,
+				"error", err,
+			)
+			m.recordEvent(primary, "Warning", "CleanupFailed",
+				"Release outputs failed: %v", err)
+			return
+		}
 	}
 
-	hc := newHandlerContext(ctx, m, primary)
-	if err := ce.fn(hc, primary); err != nil {
-		m.log.Error("cleanup failed, finalizer retained",
-			"primary", primaryKey,
-			"error", err,
-		)
-		m.recordEvent(primary, "Warning", "CleanupFailed",
-			"Cleanup failed: %v", err)
-		return
+	// Run user-provided cleanup callback if registered.
+	if ce, ok := m.cleanupFns[gvk]; ok {
+		hc := newHandlerContext(ctx, m, primary)
+		if err := ce.fn(hc, primary); err != nil {
+			m.log.Error("cleanup failed, finalizer retained",
+				"primary", primaryKey,
+				"error", err,
+			)
+			m.recordEvent(primary, "Warning", "CleanupFailed",
+				"Cleanup failed: %v", err)
+			return
+		}
 	}
 
 	if err := removeFinalizer(ctx, m.client, primary, m.finalizerName()); err != nil {
@@ -679,6 +738,41 @@ func (m *Manager) runCleanup(ctx context.Context, gvk schema.GroupVersionKind, p
 		"Cleanup complete, finalizer removed")
 }
 
+// releaseAllOutputs releases ownership on all outputs that this primary
+// contributed to (from lastOutputs). Outputs with no remaining contributors
+// are deleted.
+func (m *Manager) releaseAllOutputs(ctx context.Context, primaryGVK schema.GroupVersionKind, primaryKey types.NamespacedName) error {
+	for _, r := range m.reconcilers {
+		if r.PrimaryGVK() != primaryGVK {
+			continue
+		}
+		outputKey := fmt.Sprintf("%s/%s", r.ID(), primaryKey.String())
+		m.mu.Lock()
+		outputNNs := m.lastOutputs[outputKey]
+		m.mu.Unlock()
+
+		for nn := range outputNNs {
+			shouldDelete, err := m.getOwnership().releaseOwnership(ctx, m.client, m.scheme,
+				r.OutputGVK(), nn, r.PrimaryGVK(), primaryKey, m.managerID)
+			if err != nil {
+				return fmt.Errorf("release ownership on %s %s: %w", r.OutputGVK().Kind, nn, err)
+			}
+			if shouldDelete {
+				// Delete errors are logged but don't block finalizer removal.
+				// gcOrphans will clean up any resources that survive this.
+				if err := deleteIfExists(ctx, m.client, m.scheme, r.OutputGVK(), nn); err != nil {
+					m.log.Error("delete output after release failed",
+						"reconciler", r.ID(),
+						"resource", nn,
+						"error", err,
+					)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func (m *Manager) fullReconcile(ctx context.Context) {
 	// Track primaries already cleaned up to avoid running cleanup more than
 	// once when multiple reconcilers share the same primary GVK.
@@ -709,7 +803,7 @@ func (m *Manager) fullReconcile(ctx context.Context) {
 			}
 			nn := types.NamespacedName{Name: cObj.GetName(), Namespace: cObj.GetNamespace()}
 
-			if cObj.GetDeletionTimestamp() != nil && m.hasCleanup(r.PrimaryGVK()) {
+			if cObj.GetDeletionTimestamp() != nil && m.needsFinalizer(r.PrimaryGVK()) {
 				ck := cleanupKey{GVK: r.PrimaryGVK(), NN: nn}
 				if !cleanedUp[ck] {
 					m.runCleanup(ctx, r.PrimaryGVK(), nn, cObj)
@@ -742,7 +836,7 @@ func (m *Manager) fullReconcile(ctx context.Context) {
 			if !ok {
 				continue
 			}
-			if cObj.GetDeletionTimestamp() != nil && m.hasCleanup(sr.PrimaryGVK()) {
+			if cObj.GetDeletionTimestamp() != nil && m.needsFinalizer(sr.PrimaryGVK()) {
 				continue
 			}
 			nn := types.NamespacedName{Name: cObj.GetName(), Namespace: cObj.GetNamespace()}

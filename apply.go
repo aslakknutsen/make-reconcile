@@ -19,10 +19,11 @@ const (
 )
 
 // applyDesired uses server-side apply to create or update the desired resource.
-// It automatically sets ownerReferences pointing to the primary resource and
-// a managed-by label used for orphan garbage collection.
-func applyDesired(ctx context.Context, c client.Client, desired client.Object, ownerGVK schema.GroupVersionKind, ownerRef types.NamespacedName, ownerUID types.UID, managerID string) error {
-	setOwnerRef(desired, ownerGVK, ownerRef, ownerUID)
+// It delegates to the ownership strategy for setting owner references or
+// contributor annotations before the SSA apply. The managed-by label is always
+// set for orphan garbage collection.
+func applyDesired(ctx context.Context, c client.Client, scheme *runtime.Scheme, desired client.Object, outputGVK schema.GroupVersionKind, ownerGVK schema.GroupVersionKind, ownerRef types.NamespacedName, ownerUID types.UID, managerID string, ownership ownershipStrategy) error {
+	ownership.prepareDesired(ctx, c, scheme, desired, outputGVK, ownerGVK, ownerRef, ownerUID, managerID)
 	setManagedByLabel(desired, managerID)
 
 	opts := []client.PatchOption{
