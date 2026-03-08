@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -28,6 +30,13 @@ type ObjectStore struct {
 	Applied       []client.Object
 	Deleted       []types.NamespacedName
 	StatusPatches []client.Object
+
+	// ForeignPatched records objects that were patched via a foreign-patch
+	// reconciler (SSA with mr-patch/ field manager prefix).
+	ForeignPatched []client.Object
+	// ForeignReverted records keys of objects whose foreign-patch contributions
+	// were reverted (empty SSA apply to release field ownership).
+	ForeignReverted []types.NamespacedName
 }
 
 type objectKey struct {
@@ -76,16 +85,21 @@ func (s *ObjectStore) GetObject(gvk schema.GroupVersionKind, key types.Namespace
 	return obj.DeepCopyObject().(client.Object)
 }
 
-// Reset clears the Applied, Deleted, and StatusPatches slices.
+// Reset clears all tracking slices.
 func (s *ObjectStore) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Applied = nil
 	s.Deleted = nil
 	s.StatusPatches = nil
+	s.ForeignPatched = nil
+	s.ForeignReverted = nil
 }
 
 func (s *ObjectStore) resolveGVK(obj client.Object) schema.GroupVersionKind {
+	if u, ok := obj.(*unstructured.Unstructured); ok {
+		return u.GetObjectKind().GroupVersionKind()
+	}
 	gvks, _, err := s.scheme.ObjectKinds(obj)
 	if err != nil || len(gvks) == 0 {
 		panic(fmt.Sprintf("mrtest: type %T not registered in scheme", obj))
@@ -214,15 +228,38 @@ func (s *ObjectStore) DeleteAllOf(_ context.Context, _ client.Object, _ ...clien
 	return fmt.Errorf("not implemented")
 }
 
-func (s *ObjectStore) Patch(_ context.Context, obj client.Object, patch client.Patch, _ ...client.PatchOption) error {
+func (s *ObjectStore) Patch(_ context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	var patchOpts client.PatchOptions
+	for _, o := range opts {
+		o.ApplyToPatch(&patchOpts)
+	}
+
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	isForeignPatch := strings.HasPrefix(patchOpts.FieldManager, "mr-patch/")
+	_, isUnstructured := obj.(*unstructured.Unstructured)
+
+	if patch.Type() == types.ApplyPatchType && isForeignPatch {
+		nn := types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}
+		if isUnstructured {
+			// Revert: empty unstructured apply releases field ownership.
+			// Don't overwrite the stored object.
+			s.ForeignReverted = append(s.ForeignReverted, nn)
+			return nil
+		}
+		s.ForeignPatched = append(s.ForeignPatched, obj)
+		gvk := s.resolveGVK(obj)
+		s.objects[objectKey{GVK: gvk, Key: nn}] = obj.DeepCopyObject().(client.Object)
+		return nil
+	}
+
 	if patch.Type() == types.ApplyPatchType {
 		s.Applied = append(s.Applied, obj)
 	}
 	gvk := s.resolveGVK(obj)
 	nn := types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}
 	s.objects[objectKey{GVK: gvk, Key: nn}] = obj.DeepCopyObject().(client.Object)
-	s.mu.Unlock()
 	return nil
 }
 

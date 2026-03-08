@@ -98,11 +98,13 @@ func (h *TestHarness) Events() []Event {
 
 func (h *TestHarness) snapshot() *Result {
 	return &Result{
-		t:             h.t,
-		applied:       copyObjects(h.store.Applied),
-		deleted:       copyNNs(h.store.Deleted),
-		statusPatches: copyObjects(h.store.StatusPatches),
-		events:        h.recorder.Events(),
+		t:               h.t,
+		applied:         copyObjects(h.store.Applied),
+		deleted:         copyNNs(h.store.Deleted),
+		statusPatches:   copyObjects(h.store.StatusPatches),
+		events:          h.recorder.Events(),
+		foreignPatched:  copyObjects(h.store.ForeignPatched),
+		foreignReverted: copyNNs(h.store.ForeignReverted),
 	}
 }
 

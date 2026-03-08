@@ -10,11 +10,13 @@ import (
 
 // Result captures the outputs, deletes, and events from a Reconcile or Settle call.
 type Result struct {
-	t             *testing.T
-	applied       []client.Object
-	deleted       []types.NamespacedName
-	statusPatches []client.Object
-	events        []Event
+	t               *testing.T
+	applied         []client.Object
+	deleted         []types.NamespacedName
+	statusPatches   []client.Object
+	events          []Event
+	foreignPatched  []client.Object
+	foreignReverted []types.NamespacedName
 }
 
 // Applied returns all objects that were applied (SSA-patched) during the reconcile.
@@ -99,6 +101,51 @@ func (r *Result) AssertEventContains(eventType, reason, substring string) {
 		}
 	}
 	r.t.Errorf("expected event %s/%s containing %q, got %v", eventType, reason, substring, r.events)
+}
+
+// ForeignPatched returns all objects that were patched via foreign-patch reconcilers.
+func (r *Result) ForeignPatched() []client.Object { return r.foreignPatched }
+
+// ForeignReverted returns the keys of objects whose foreign-patch contributions were reverted.
+func (r *Result) ForeignReverted() []types.NamespacedName { return r.foreignReverted }
+
+// AssertForeignPatched asserts that a foreign object was patched.
+func (r *Result) AssertForeignPatched(name, namespace string) {
+	r.t.Helper()
+	for _, obj := range r.foreignPatched {
+		if obj.GetName() == name && obj.GetNamespace() == namespace {
+			return
+		}
+	}
+	r.t.Errorf("expected foreign patch on %s/%s, but none found", namespace, name)
+}
+
+// AssertForeignPatchedCount asserts the total number of foreign-patched objects.
+func (r *Result) AssertForeignPatchedCount(n int) {
+	r.t.Helper()
+	if len(r.foreignPatched) != n {
+		r.t.Errorf("expected %d foreign patches, got %d", n, len(r.foreignPatched))
+	}
+}
+
+// AssertForeignReverted asserts that a foreign object had its contributions reverted.
+func (r *Result) AssertForeignReverted(name, namespace string) {
+	r.t.Helper()
+	nn := types.NamespacedName{Name: name, Namespace: namespace}
+	for _, d := range r.foreignReverted {
+		if d == nn {
+			return
+		}
+	}
+	r.t.Errorf("expected foreign revert on %s/%s, but none found", namespace, name)
+}
+
+// AssertForeignRevertedCount asserts the total number of foreign-reverted objects.
+func (r *Result) AssertForeignRevertedCount(n int) {
+	r.t.Helper()
+	if len(r.foreignReverted) != n {
+		r.t.Errorf("expected %d foreign reverts, got %d", n, len(r.foreignReverted))
+	}
 }
 
 // AssertStatusPatched asserts that a status patch was applied for the given name.
