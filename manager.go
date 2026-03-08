@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,7 @@ type Manager struct {
 	mu                sync.Mutex
 	reconcilers       []subReconciler
 	statusReconcilers []statusSubReconciler
+	patchReconcilers  []patchSubReconciler
 	watchedGVKs       map[schema.GroupVersionKind]bool
 	watchPredicates   map[schema.GroupVersionKind][]EventPredicate
 	tracker           *dependencyTracker
@@ -47,6 +49,11 @@ type Manager struct {
 	// (reconciler, primary) pair on the last run. Used to detect deletions
 	// when the set of outputs shrinks.
 	lastOutputs map[string]map[types.NamespacedName]bool
+
+	// lastPatches tracks which foreign resource keys were patched by each
+	// (patch reconciler, primary) pair on the last run. Used to revert
+	// contributions when the set of targets shrinks or primary is deleted.
+	lastPatches map[string]map[types.NamespacedName]bool
 
 	// ownership controls how output resources are linked to primaries.
 	// Default is ownerRefStrategy (OwnerReferences + Kubernetes GC).
@@ -154,6 +161,7 @@ func NewManager(cfg *rest.Config, scheme *runtime.Scheme, opts ...ManagerOption)
 		resyncPeriod:    5 * time.Minute,
 		managerID:       "default",
 		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
+		lastPatches:     make(map[string]map[types.NamespacedName]bool),
 		ownership:       &ownerRefStrategy{},
 	}
 	for _, o := range opts {
@@ -176,6 +184,7 @@ func NewManagerForTest(scheme *runtime.Scheme, opts ...ManagerOption) *Manager {
 		resyncPeriod:    5 * time.Minute,
 		managerID:       "default",
 		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
+		lastPatches:     make(map[string]map[types.NamespacedName]bool),
 		ownership:       &ownerRefStrategy{},
 	}
 	for _, o := range opts {
@@ -416,6 +425,14 @@ func (h *eventHandler) handle(obj client.Object) {
 			}
 		}
 	}
+	if !isPrimaryForAnyReconciler {
+		for _, pr := range h.mgr.patchReconcilers {
+			if pr.PrimaryGVK() == h.gvk {
+				isPrimaryForAnyReconciler = true
+				break
+			}
+		}
+	}
 
 	if isPrimaryForAnyReconciler && h.mgr.needsFinalizer(h.gvk) {
 		primary := h.mgr.getPrimary(ctx, h.gvk, nn)
@@ -452,6 +469,25 @@ func (h *eventHandler) handle(obj client.Object) {
 			if r.ID() == ref.ReconcilerID {
 				h.mgr.runSubReconciler(ctx, r, ref.PrimaryKey)
 				recordAffected(r.PrimaryGVK(), ref.PrimaryKey)
+				break
+			}
+		}
+	}
+
+	// Phase 1b: run patch reconcilers.
+
+	for _, pr := range h.mgr.patchReconcilers {
+		if pr.PrimaryGVK() == h.gvk {
+			h.mgr.runPatchReconciler(ctx, pr, nn)
+			recordAffected(pr.PrimaryGVK(), nn)
+		}
+	}
+
+	for _, ref := range refs {
+		for _, pr := range h.mgr.patchReconcilers {
+			if pr.ID() == ref.ReconcilerID {
+				h.mgr.runPatchReconciler(ctx, pr, ref.PrimaryKey)
+				recordAffected(pr.PrimaryGVK(), ref.PrimaryKey)
 				break
 			}
 		}
@@ -610,6 +646,100 @@ func (m *Manager) runSubReconciler(ctx context.Context, r subReconciler, primary
 	}
 }
 
+func (m *Manager) runPatchReconciler(ctx context.Context, r patchSubReconciler, primaryKey types.NamespacedName) {
+	patchKey := fmt.Sprintf("%s/%s", r.ID(), primaryKey.String())
+
+	if m.needsFinalizer(r.PrimaryGVK()) {
+		primary := m.getPrimary(ctx, r.PrimaryGVK(), primaryKey)
+		if primary == nil {
+			return
+		}
+		if primary.GetDeletionTimestamp() != nil {
+			return
+		}
+		if !hasFinalizer(primary, m.finalizerName()) {
+			if err := addFinalizer(ctx, m.client, primary, m.finalizerName()); err != nil {
+				m.log.Error("add finalizer failed",
+					"primary", primaryKey,
+					"error", err,
+				)
+			}
+		}
+	}
+
+	outputs, err := r.Reconcile(ctx, m, primaryKey)
+	if err != nil {
+		m.log.Error("patch reconciler failed",
+			"reconciler", r.ID(),
+			"primary", primaryKey,
+			"error", err,
+		)
+		m.recordEvent(m.getPrimary(ctx, r.PrimaryGVK(), primaryKey),
+			"Warning", "ReconcileFailed",
+			"Patch reconciler %s failed: %v", r.ID(), err)
+		return
+	}
+
+	wantKeys := make(map[types.NamespacedName]bool)
+	for _, out := range outputs {
+		wantKeys[out.TargetKey] = true
+
+		pid := patchID(m.managerID, r.ID(), primaryKey)
+		if err := r.Strategy().Apply(ctx, m.client, m.scheme, r.TargetGVK(), out.TargetKey, out.Contribution, pid); err != nil {
+			m.log.Error("patch apply failed",
+				"reconciler", r.ID(),
+				"target", out.TargetKey,
+				"error", err,
+			)
+			m.recordEvent(m.getPrimary(ctx, r.PrimaryGVK(), primaryKey),
+				"Warning", "PatchFailed",
+				"Failed to patch %s %s: %v", r.TargetGVK().Kind, out.TargetKey, err)
+		} else {
+			m.recordEvent(m.getPrimary(ctx, r.PrimaryGVK(), primaryKey),
+				"Normal", "Patched",
+				"Patched %s %s", r.TargetGVK().Kind, out.TargetKey)
+		}
+	}
+
+	// Register targets as tracked dependencies so external modifications
+	// trigger re-reconciliation to restore contributed fields.
+	var targetDeps []depKey
+	for nn := range wantKeys {
+		targetDeps = append(targetDeps, depKey{GVK: r.TargetGVK(), NamespacedName: nn})
+	}
+	m.tracker.AppendNarrow(
+		reconcilerRef{ReconcilerID: r.ID(), PrimaryKey: primaryKey},
+		targetDeps,
+	)
+
+	// Revert contributions to targets that are no longer in the desired set.
+	// Read prevKeys under lock but defer the lastPatches update until after
+	// reverts complete. Failed reverts are kept in the tracking map so they
+	// are retried on the next reconcile instead of being permanently orphaned.
+	m.mu.Lock()
+	prevKeys := maps.Clone(m.lastPatches[patchKey])
+	m.mu.Unlock()
+
+	finalKeys := maps.Clone(wantKeys)
+	for prev := range prevKeys {
+		if !wantKeys[prev] {
+			pid := patchID(m.managerID, r.ID(), primaryKey)
+			if err := r.Strategy().Revert(ctx, m.client, m.scheme, r.TargetGVK(), prev, pid); err != nil {
+				m.log.Error("patch revert failed",
+					"reconciler", r.ID(),
+					"target", prev,
+					"error", err,
+				)
+				finalKeys[prev] = true
+			}
+		}
+	}
+
+	m.mu.Lock()
+	m.lastPatches[patchKey] = finalKeys
+	m.mu.Unlock()
+}
+
 func (m *Manager) getPrimary(ctx context.Context, gvk schema.GroupVersionKind, nn types.NamespacedName) client.Object {
 	obj, err := m.scheme.New(gvk)
 	if err != nil {
@@ -665,11 +795,23 @@ func (m *Manager) getOwnership() ownershipStrategy {
 	return m.ownership
 }
 
+// hasPatchReconcilers returns true if any patch reconciler uses this GVK as
+// its primary. Patch reconcilers need finalizers for auto-revert on deletion.
+func (m *Manager) hasPatchReconcilers(gvk schema.GroupVersionKind) bool {
+	for _, r := range m.patchReconcilers {
+		if r.PrimaryGVK() == gvk {
+			return true
+		}
+	}
+	return false
+}
+
 // needsFinalizer returns true if a finalizer is needed for the given primary
-// GVK — either because the user registered an OnDelete callback or because
-// the ownership strategy requires finalizer-based cleanup (annotation strategy).
+// GVK — either because the user registered an OnDelete callback, the ownership
+// strategy requires finalizer-based cleanup, or patch reconcilers need
+// auto-revert on deletion.
 func (m *Manager) needsFinalizer(gvk schema.GroupVersionKind) bool {
-	return m.hasCleanup(gvk) || m.getOwnership().needsFinalizer()
+	return m.hasCleanup(gvk) || m.getOwnership().needsFinalizer() || m.hasPatchReconcilers(gvk)
 }
 
 // runCleanup handles primary deletion: releases ownership on outputs,
@@ -677,6 +819,19 @@ func (m *Manager) needsFinalizer(gvk schema.GroupVersionKind) bool {
 // and clears internal state. On failure the finalizer stays in place so
 // Kubernetes will re-trigger the event.
 func (m *Manager) runCleanup(ctx context.Context, gvk schema.GroupVersionKind, primaryKey types.NamespacedName, primary client.Object) {
+	// Revert all foreign patches contributed by this primary.
+	if m.hasPatchReconcilers(gvk) {
+		if err := m.revertAllPatches(ctx, gvk, primaryKey); err != nil {
+			m.log.Error("revert patches failed, finalizer retained",
+				"primary", primaryKey,
+				"error", err,
+			)
+			m.recordEvent(primary, "Warning", "CleanupFailed",
+				"Revert patches failed: %v", err)
+			return
+		}
+	}
+
 	// Release annotation-based ownership on all outputs for this primary.
 	if m.getOwnership().needsFinalizer() {
 		if err := m.releaseAllOutputs(ctx, gvk, primaryKey); err != nil {
@@ -712,11 +867,16 @@ func (m *Manager) runCleanup(ctx context.Context, gvk schema.GroupVersionKind, p
 		return
 	}
 
-	// Clear lastOutputs and tracker entries for this primary.
+	// Clear lastOutputs, lastPatches, and tracker entries for this primary.
 	m.mu.Lock()
 	for key := range m.lastOutputs {
 		if strings.HasSuffix(key, "/"+primaryKey.String()) {
 			delete(m.lastOutputs, key)
+		}
+	}
+	for key := range m.lastPatches {
+		if strings.HasSuffix(key, "/"+primaryKey.String()) {
+			delete(m.lastPatches, key)
 		}
 	}
 	m.mu.Unlock()
@@ -730,6 +890,12 @@ func (m *Manager) runCleanup(ctx context.Context, gvk schema.GroupVersionKind, p
 	for _, sr := range m.statusReconcilers {
 		if sr.PrimaryGVK() == gvk {
 			ref := reconcilerRef{ReconcilerID: sr.ID(), PrimaryKey: primaryKey}
+			m.tracker.SetDeps(ref, nil, nil)
+		}
+	}
+	for _, pr := range m.patchReconcilers {
+		if pr.PrimaryGVK() == gvk {
+			ref := reconcilerRef{ReconcilerID: pr.ID(), PrimaryKey: primaryKey}
 			m.tracker.SetDeps(ref, nil, nil)
 		}
 	}
@@ -748,7 +914,7 @@ func (m *Manager) releaseAllOutputs(ctx context.Context, primaryGVK schema.Group
 		}
 		outputKey := fmt.Sprintf("%s/%s", r.ID(), primaryKey.String())
 		m.mu.Lock()
-		outputNNs := m.lastOutputs[outputKey]
+		outputNNs := maps.Clone(m.lastOutputs[outputKey])
 		m.mu.Unlock()
 
 		for nn := range outputNNs {
@@ -767,6 +933,28 @@ func (m *Manager) releaseAllOutputs(ctx context.Context, primaryGVK schema.Group
 						"error", err,
 					)
 				}
+			}
+		}
+	}
+	return nil
+}
+
+// revertAllPatches reverts all foreign-patch contributions from the given
+// primary. Called during cleanup when the primary is being deleted.
+func (m *Manager) revertAllPatches(ctx context.Context, primaryGVK schema.GroupVersionKind, primaryKey types.NamespacedName) error {
+	for _, r := range m.patchReconcilers {
+		if r.PrimaryGVK() != primaryGVK {
+			continue
+		}
+		pk := fmt.Sprintf("%s/%s", r.ID(), primaryKey.String())
+		m.mu.Lock()
+		targetNNs := maps.Clone(m.lastPatches[pk])
+		m.mu.Unlock()
+
+		pid := patchID(m.managerID, r.ID(), primaryKey)
+		for nn := range targetNNs {
+			if err := r.Strategy().Revert(ctx, m.client, m.scheme, r.TargetGVK(), nn, pid); err != nil {
+				return fmt.Errorf("revert patch on %s %s: %w", r.TargetGVK().Kind, nn, err)
 			}
 		}
 	}
@@ -813,6 +1001,40 @@ func (m *Manager) fullReconcile(ctx context.Context) {
 			}
 
 			m.runSubReconciler(ctx, r, nn)
+		}
+	}
+
+	// Phase 1b: all patch reconcilers.
+	for _, pr := range m.patchReconcilers {
+		list := newListForGVK(m.scheme, pr.PrimaryGVK())
+		if err := m.cache.List(ctx, list); err != nil {
+			m.log.Error("full reconcile patch list failed",
+				"reconciler", pr.ID(),
+				"error", err,
+			)
+			continue
+		}
+		items, err := meta.ExtractList(list)
+		if err != nil {
+			continue
+		}
+		for _, item := range items {
+			cObj, ok := item.(client.Object)
+			if !ok {
+				continue
+			}
+			nn := types.NamespacedName{Name: cObj.GetName(), Namespace: cObj.GetNamespace()}
+
+			if cObj.GetDeletionTimestamp() != nil && m.needsFinalizer(pr.PrimaryGVK()) {
+				ck := cleanupKey{GVK: pr.PrimaryGVK(), NN: nn}
+				if !cleanedUp[ck] {
+					m.runCleanup(ctx, pr.PrimaryGVK(), nn, cObj)
+					cleanedUp[ck] = true
+				}
+				continue
+			}
+
+			m.runPatchReconciler(ctx, pr, nn)
 		}
 	}
 
