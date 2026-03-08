@@ -713,11 +713,14 @@ func (m *Manager) runPatchReconciler(ctx context.Context, r patchSubReconciler, 
 	)
 
 	// Revert contributions to targets that are no longer in the desired set.
+	// Read prevKeys under lock but defer the lastPatches update until after
+	// reverts complete. Failed reverts are kept in the tracking map so they
+	// are retried on the next reconcile instead of being permanently orphaned.
 	m.mu.Lock()
-	prevKeys := m.lastPatches[patchKey]
-	m.lastPatches[patchKey] = wantKeys
+	prevKeys := maps.Clone(m.lastPatches[patchKey])
 	m.mu.Unlock()
 
+	finalKeys := maps.Clone(wantKeys)
 	for prev := range prevKeys {
 		if !wantKeys[prev] {
 			pid := patchID(m.managerID, r.ID(), primaryKey)
@@ -727,9 +730,14 @@ func (m *Manager) runPatchReconciler(ctx context.Context, r patchSubReconciler, 
 					"target", prev,
 					"error", err,
 				)
+				finalKeys[prev] = true
 			}
 		}
 	}
+
+	m.mu.Lock()
+	m.lastPatches[patchKey] = finalKeys
+	m.mu.Unlock()
 }
 
 func (m *Manager) getPrimary(ctx context.Context, gvk schema.GroupVersionKind, nn types.NamespacedName) client.Object {
