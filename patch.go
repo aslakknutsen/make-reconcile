@@ -105,9 +105,14 @@ func (r *typedPatchManySubReconciler[P, T]) Reconcile(ctx context.Context, mgr *
 		return nil, nil
 	}
 	var out []patchOutput
+	seen := make(map[types.NamespacedName]bool, len(results))
 	for _, item := range results {
 		if !isNilObject(item) {
 			nn := types.NamespacedName{Name: item.GetName(), Namespace: item.GetNamespace()}
+			if seen[nn] {
+				return nil, fmt.Errorf("duplicate target key %v returned from patch reconciler %s", nn, r.id)
+			}
+			seen[nn] = true
 			out = append(out, patchOutput{TargetKey: nn, Contribution: item})
 		}
 	}
