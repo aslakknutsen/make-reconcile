@@ -2,12 +2,17 @@ package makereconcile
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
+	"sync"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 func TestReconcilePatchRegistration(t *testing.T) {
@@ -236,6 +241,170 @@ func TestPatchFieldManagerName(t *testing.T) {
 	if len(name) > 128 {
 		t.Errorf("field manager exceeds 128 chars: %d", len(name))
 	}
+}
+
+func TestPatchReconcilerFailedRevertRetainsKey(t *testing.T) {
+	s := coreScheme()
+
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "session", Namespace: "default"},
+	})
+
+	strategy := &failingRevertStrategy{
+		failKeys: map[types.NamespacedName]bool{
+			{Name: "svc-b", Namespace: "default"}: true,
+		},
+	}
+
+	targetCount := 2
+	mgr := &Manager{
+		scheme:          s,
+		client:          &fakeClient{},
+		cache:           store,
+		log:             slog.Default(),
+		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
+		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
+		tracker:         newDependencyTracker(),
+		managerID:       "default",
+		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
+		lastPatches:     make(map[string]map[types.NamespacedName]bool),
+		ownership:       &ownerRefStrategy{},
+	}
+
+	configMaps := Watch[*corev1.ConfigMap](mgr)
+	services := Watch[*corev1.Service](mgr)
+
+	ReconcilePatchMany(mgr, configMaps, services,
+		func(hc *HandlerContext, cm *corev1.ConfigMap) []*corev1.Service {
+			var out []*corev1.Service
+			for i := 0; i < targetCount; i++ {
+				out = append(out, &corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "svc-" + string(rune('a'+i)),
+						Namespace: cm.Namespace,
+					},
+				})
+			}
+			return out
+		},
+		func(cfg *patchConfig) { cfg.strategy = strategy },
+	)
+
+	r := mgr.patchReconcilers[0]
+	primaryKey := types.NamespacedName{Name: "session", Namespace: "default"}
+	patchKey := fmt.Sprintf("%s/%s", r.ID(), primaryKey.String())
+	ctx := context.Background()
+
+	// First reconcile: patches svc-a and svc-b.
+	mgr.runPatchReconciler(ctx, r, primaryKey)
+
+	mgr.mu.Lock()
+	tracked := mgr.lastPatches[patchKey]
+	mgr.mu.Unlock()
+	if len(tracked) != 2 {
+		t.Fatalf("expected 2 tracked keys after first reconcile, got %d", len(tracked))
+	}
+
+	// Shrink to 1 target. Revert of svc-b will fail.
+	targetCount = 1
+	strategy.resetRecorded()
+	mgr.runPatchReconciler(ctx, r, primaryKey)
+
+	mgr.mu.Lock()
+	tracked = mgr.lastPatches[patchKey]
+	mgr.mu.Unlock()
+
+	svcB := types.NamespacedName{Name: "svc-b", Namespace: "default"}
+	if !tracked[svcB] {
+		t.Fatal("svc-b should remain in lastPatches after failed revert")
+	}
+	if len(tracked) != 2 {
+		t.Fatalf("expected 2 tracked keys (svc-a wanted + svc-b failed revert), got %d", len(tracked))
+	}
+
+	// Verify svc-b was not recorded as successfully reverted.
+	for _, k := range strategy.getReverted() {
+		if k == svcB {
+			t.Fatal("svc-b should not appear in successful reverts")
+		}
+	}
+
+	// Allow svc-b revert to succeed on the next reconcile.
+	strategy.clearFailKey(svcB)
+	strategy.resetRecorded()
+	mgr.runPatchReconciler(ctx, r, primaryKey)
+
+	mgr.mu.Lock()
+	tracked = mgr.lastPatches[patchKey]
+	mgr.mu.Unlock()
+
+	if tracked[svcB] {
+		t.Fatal("svc-b should be removed from lastPatches after successful revert")
+	}
+	if len(tracked) != 1 {
+		t.Fatalf("expected 1 tracked key after successful revert, got %d", len(tracked))
+	}
+
+	found := false
+	for _, k := range strategy.getReverted() {
+		if k == svcB {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("svc-b should appear in successful reverts after retry")
+	}
+}
+
+// failingRevertStrategy is a patchStrategy that returns errors for
+// configurable target keys on Revert, letting tests exercise the
+// failed-revert retention logic in runPatchReconciler.
+type failingRevertStrategy struct {
+	mu       sync.Mutex
+	failKeys map[types.NamespacedName]bool
+	applied  []types.NamespacedName
+	reverted []types.NamespacedName
+}
+
+func (s *failingRevertStrategy) Apply(_ context.Context, _ client.Client, _ *runtime.Scheme,
+	_ schema.GroupVersionKind, targetKey types.NamespacedName,
+	_ client.Object, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.applied = append(s.applied, targetKey)
+	return nil
+}
+
+func (s *failingRevertStrategy) Revert(_ context.Context, _ client.Client, _ *runtime.Scheme,
+	_ schema.GroupVersionKind, targetKey types.NamespacedName, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failKeys[targetKey] {
+		return fmt.Errorf("simulated revert failure for %v", targetKey)
+	}
+	s.reverted = append(s.reverted, targetKey)
+	return nil
+}
+
+func (s *failingRevertStrategy) clearFailKey(key types.NamespacedName) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.failKeys, key)
+}
+
+func (s *failingRevertStrategy) resetRecorded() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.applied = nil
+	s.reverted = nil
+}
+
+func (s *failingRevertStrategy) getReverted() []types.NamespacedName {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := make([]types.NamespacedName, len(s.reverted))
+	copy(cp, s.reverted)
+	return cp
 }
 
 func TestHasPatchReconcilersAffectsNeedsFinalizer(t *testing.T) {
