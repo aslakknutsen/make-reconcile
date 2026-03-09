@@ -131,6 +131,83 @@ func TestCleanupRunsOnDeletion(t *testing.T) {
 	}
 }
 
+func TestCleanupFallsThroughToDependencyNotification(t *testing.T) {
+	s := coreScheme()
+	now := metav1.Now()
+
+	store := newTestStore(s,
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "shared-cm", Namespace: "default", UID: "cm-uid-1",
+				DeletionTimestamp: &now,
+				Finalizers:        []string{"make-reconcile.io/finalizer-test"},
+			},
+		},
+		&appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "my-deploy", Namespace: "default", UID: "deploy-uid-1",
+			},
+		},
+	)
+	fc := &fakeClient{}
+	mgr := &Manager{
+		scheme:          s,
+		cache:           store,
+		client:          fc,
+		log:             slog.Default(),
+		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
+		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
+		tracker:         newDependencyTracker(),
+		managerID:       "test",
+		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
+	}
+
+	// Reconciler A: ConfigMap → Service (with OnDelete cleanup).
+	configMaps := Watch[*corev1.ConfigMap](mgr)
+	var cleanupCalled bool
+	OnDelete(mgr, configMaps, func(hc *HandlerContext, cm *corev1.ConfigMap) error {
+		cleanupCalled = true
+		return nil
+	})
+	Reconcile(mgr, configMaps, func(hc *HandlerContext, cm *corev1.ConfigMap) *corev1.Service {
+		t.Error("primary reconciler should not run during deletion")
+		return nil
+	})
+
+	// Reconciler B: Deployment → Service, Fetch-ing ConfigMap as dependency.
+	deployments := Watch[*appsv1.Deployment](mgr)
+	var dependentReconciled bool
+	Reconcile(mgr, deployments, func(hc *HandlerContext, dep *appsv1.Deployment) *corev1.Service {
+		_ = Fetch(hc, configMaps, FilterName("shared-cm", dep.Namespace))
+		dependentReconciled = true
+		return &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: dep.Name + "-svc", Namespace: dep.Namespace},
+		}
+	})
+
+	// Seed the tracker: reconciler B depends on the ConfigMap.
+	cmGVK := schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"}
+	deployKey := types.NamespacedName{Name: "my-deploy", Namespace: "default"}
+	mgr.tracker.SetDeps(
+		reconcilerRef{ReconcilerID: "Deployment->Service", PrimaryKey: deployKey},
+		[]depKey{{GVK: cmGVK, NamespacedName: types.NamespacedName{Name: "shared-cm", Namespace: "default"}}},
+		nil,
+	)
+
+	// Fire a ConfigMap event (simulates informer detecting deletion).
+	handler := &eventHandler{mgr: mgr, gvk: cmGVK}
+	handler.handle(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared-cm", Namespace: "default"},
+	})
+
+	if !cleanupCalled {
+		t.Error("cleanup should have run for the primary ConfigMap reconciler")
+	}
+	if !dependentReconciled {
+		t.Error("dependent Deployment reconciler should have been notified via dependency path")
+	}
+}
+
 func TestCleanupErrorRetainsFinalizerAndEmitsEvent(t *testing.T) {
 	s := coreScheme()
 	now := metav1.Now()
