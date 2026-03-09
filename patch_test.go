@@ -226,6 +226,42 @@ func TestPatchManySubReconcilerInvocation(t *testing.T) {
 	}
 }
 
+func TestPatchManyDuplicateTargetKeyReturnsError(t *testing.T) {
+	s := coreScheme()
+	store := newTestStore(s, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cm", Namespace: "ns"},
+	})
+	mgr := &Manager{
+		scheme:          s,
+		cache:           store,
+		watchedGVKs:     make(map[schema.GroupVersionKind]bool),
+		watchPredicates: make(map[schema.GroupVersionKind][]EventPredicate),
+		tracker:         newDependencyTracker(),
+		managerID:       "default",
+		lastOutputs:     make(map[string]map[types.NamespacedName]bool),
+		lastPatches:     make(map[string]map[types.NamespacedName]bool),
+	}
+
+	configMaps := Watch[*corev1.ConfigMap](mgr)
+	services := Watch[*corev1.Service](mgr)
+
+	ReconcilePatchMany(mgr, configMaps, services, func(hc *HandlerContext, cm *corev1.ConfigMap) []*corev1.Service {
+		return []*corev1.Service{
+			{ObjectMeta: metav1.ObjectMeta{Name: "dup-svc", Namespace: cm.Namespace}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "dup-svc", Namespace: cm.Namespace}},
+		}
+	})
+
+	r := mgr.patchReconcilers[0]
+	_, err := r.Reconcile(context.Background(), mgr, types.NamespacedName{Name: "my-cm", Namespace: "ns"})
+	if err == nil {
+		t.Fatal("expected error for duplicate target keys, got nil")
+	}
+	if got := err.Error(); got != "duplicate target key ns/dup-svc returned from patch reconciler ConfigMap~>[]Service" {
+		t.Errorf("unexpected error message: %s", got)
+	}
+}
+
 func TestPatchFieldManagerName(t *testing.T) {
 	name := patchFieldManagerName("default/ConfigMap~>Service/default/my-cm")
 	if name != "mr-patch/default/ConfigMap~>Service/default/my-cm" {
