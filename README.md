@@ -119,6 +119,107 @@ mr.ReconcileStatus(mgr, apps, func(hc *mr.HandlerContext, app *MyApp) *MyAppStat
 })
 ```
 
+### ReconcilePatch / ReconcilePatchMany
+
+`ReconcilePatch[P, T](mgr, primary, target, fn)` registers a sub-reconciler that contributes fields to a **foreign resource** — one you don't own. The function returns a partial object whose Name/Namespace identify the target. The framework applies only the contributed fields via server-side apply with a reconciler-specific field manager, so multiple controllers can write to the same target without conflict.
+
+No OwnerReference or managed-by label is set on the target. On primary deletion, the framework automatically reverts contributions (releases field ownership) before removing the finalizer.
+
+`ReconcilePatchMany` is the same for the one-to-many case.
+
+```go
+gateways := mr.Watch[*gwv1.Gateway](mgr)
+
+mr.ReconcilePatch(mgr, apps, gateways, func(hc *mr.HandlerContext, app *MyApp) *gwv1.Gateway {
+    if app.Spec.RouteHost == "" {
+        return nil // remove contribution
+    }
+    return &gwv1.Gateway{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      "shared-gateway",
+            Namespace: "istio-system",
+        },
+        Spec: gwv1.GatewaySpec{
+            Listeners: []gwv1.Listener{{
+                Name:     gwv1.SectionName(app.Name),
+                Hostname: hostPtr(app.Spec.RouteHost),
+                Port:     443,
+                Protocol: gwv1.HTTPSProtocolType,
+            }},
+        },
+    }
+})
+```
+
+### OnDelete (Finalizer Management)
+
+`OnDelete[P](mgr, primary, fn)` registers a cleanup callback that runs when a primary resource is being deleted. The framework automatically manages a finalizer on the primary: it adds the finalizer on first reconciliation and removes it after the cleanup callback succeeds.
+
+The callback receives a `HandlerContext` so it can `Fetch` resources needed for cleanup. Return `nil` to indicate success (finalizer removed). Return an error to retry on the next event (finalizer stays).
+
+Only one `OnDelete` registration is allowed per primary GVK. Calling `OnDelete` again for the same primary type replaces the previous callback.
+
+```go
+mr.OnDelete(mgr, platforms, func(hc *mr.HandlerContext, p *Platform) error {
+    vs := mr.Fetch(hc, virtualServices, mr.FilterName(p.Name+"-vs", p.Namespace))
+    if vs != nil {
+        // revert injected route
+    }
+    return nil
+})
+```
+
+### Watch and Reconcile Predicates
+
+Watch predicates filter informer events before they reach the dependency tracker. Use `WithGenerationChanged()` to suppress status-only updates (breaks the status write feedback loop) or `WithEventPredicate()` for custom filtering.
+
+```go
+apps := mr.Watch[*MyApp](mgr, mr.WithGenerationChanged())
+```
+
+Reconcile predicates filter at the sub-reconciler level. `WithPredicate()` runs after fetching the primary but before calling the reconciler function. If it returns false, the reconciler is skipped and stale outputs are cleaned up.
+
+```go
+mr.Reconcile(mgr, apps, func(hc *mr.HandlerContext, app *MyApp) *appsv1.Deployment {
+    return &appsv1.Deployment{/* ... */}
+}, mr.WithPredicate(func(app *MyApp) bool {
+    return app.Spec.Tier == "premium"
+}))
+```
+
+### Kubernetes Events
+
+When configured with `WithEventRecorder()`, the framework emits Kubernetes events on primary resources for successful applies, stale output deletions, and reconciliation errors. Sub-reconcilers can also emit custom events via `HandlerContext.RecordEvent`.
+
+```go
+mgr, _ := mr.NewManager(cfg, scheme, mr.WithEventRecorder(recorder))
+
+mr.Reconcile(mgr, apps, func(hc *mr.HandlerContext, app *MyApp) *appsv1.Deployment {
+    cm := mr.Fetch(hc, configMaps, mr.FilterName(app.Spec.ConfigRef, app.Namespace))
+    if cm == nil {
+        hc.RecordEvent("Warning", "ConfigMapNotFound", "config %s not found", app.Spec.ConfigRef)
+        return nil
+    }
+    return &appsv1.Deployment{/* ... */}
+})
+```
+
+### Pending Watches (Missing CRDs)
+
+If a CRD is not installed at startup, the manager defers its watch and retries registration in the background. This avoids hard failures when optional CRDs are installed later. Configure the retry interval with `WithPendingWatchRetryInterval()`.
+
+### Multi-Owner Tracking
+
+`WithAnnotationOwnership()` switches from OwnerReferences to annotation-based contributor tracking. Instead of relying on Kubernetes GC, the framework maintains a contributor list in an annotation on the output resource. The output is only deleted when the last contributor is removed.
+
+This is useful when multiple primaries produce the same output (e.g. shared ConfigMaps, shared Gateway listeners). The framework adds finalizers automatically for cleanup. Composes with `OnDelete` callbacks.
+
+Use `WithManagerID()` to scope orphan GC when running multiple independent managers in the same cluster.
+
+```go
+mgr, _ := mr.NewManager(cfg, scheme, mr.WithAnnotationOwnership())
+```
+
 ### Full Resync
 
 A periodic full reconcile walks all primary resources and re-runs all sub-reconcilers regardless of events. This is the safety net — if an event is missed, the full resync catches drift. Configurable via `WithResyncPeriod()`.
@@ -141,25 +242,44 @@ A periodic full reconcile walks all primary resources and re-runs all sub-reconc
 mgr, err := mr.NewManager(cfg, scheme,
     mr.WithResyncPeriod(10*time.Minute),
     mr.WithLogger(logger),
+    mr.WithManagerID("my-controller"),
+    mr.WithEventRecorder(recorder),
+    mr.WithAnnotationOwnership(),
+    mr.WithPendingWatchRetryInterval(30*time.Second),
 )
 
-// Watch a resource type.
-col := mr.Watch[*corev1.Pod](mgr)
+// Watch a resource type, optionally with predicates.
+pods := mr.Watch[*corev1.Pod](mgr)
+apps := mr.Watch[*MyApp](mgr, mr.WithGenerationChanged())
+configMaps := mr.Watch[*corev1.ConfigMap](mgr, mr.WithEventPredicate(mr.EventPredicate{
+    Update: func(old, new client.Object) bool { return old.GetResourceVersion() != new.GetResourceVersion() },
+}))
 
-// Register a 1:1 sub-reconciler.
-mr.Reconcile[P, T](mgr, primaryCollection, func(hc *mr.HandlerContext, p P) T { ... })
+// Register a 1:1 sub-reconciler (with optional predicate).
+mr.Reconcile[P, T](mgr, primary, func(hc *mr.HandlerContext, p P) T { ... })
+mr.Reconcile[P, T](mgr, primary, fn, mr.WithPredicate(func(p P) bool { ... }))
 
 // Register a 1:N sub-reconciler.
-mr.ReconcileMany[P, T](mgr, primaryCollection, func(hc *mr.HandlerContext, p P) []T { ... })
+mr.ReconcileMany[P, T](mgr, primary, func(hc *mr.HandlerContext, p P) []T { ... })
 
 // Register a status reconciler (runs after output reconcilers).
-mr.ReconcileStatus[P, S](mgr, primaryCollection, func(hc *mr.HandlerContext, p P) *S { ... })
+mr.ReconcileStatus[P, S](mgr, primary, func(hc *mr.HandlerContext, p P) *S { ... })
+
+// Register a foreign-resource patch reconciler (scoped SSA, no OwnerRef).
+mr.ReconcilePatch[P, T](mgr, primary, target, func(hc *mr.HandlerContext, p P) T { ... })
+mr.ReconcilePatchMany[P, T](mgr, primary, target, func(hc *mr.HandlerContext, p P) []T { ... })
+
+// Register a cleanup callback with automatic finalizer management.
+mr.OnDelete[P](mgr, primary, func(hc *mr.HandlerContext, p P) error { ... })
 
 // Inside a sub-reconciler: fetch a single dependency.
 obj := mr.Fetch[T](hc, collection, mr.FilterName("name", "namespace"))
 
 // Inside a sub-reconciler: fetch all matching.
 objs := mr.FetchAll[T](hc, collection, mr.FilterNamespace("default"))
+
+// Inside a sub-reconciler: emit a Kubernetes event on the primary.
+hc.RecordEvent("Warning", "ConfigMissing", "config %s not found", name)
 
 // Filters.
 mr.FilterName(name, namespace)
@@ -174,12 +294,11 @@ mgr.Start(ctx)
 
 These are tracked directions for the project. Contributions welcome.
 
-- **Foreign resource status** (e.g. Gateway API policy attachment): write status entries to resources you don't own, with field-manager-scoped SSA and finalizer-based cleanup
+- **Foreign resource status** (e.g. Gateway API policy attachment): write status entries to foreign resources via `c.Status().Patch(...)` with field-manager-scoped SSA. `ReconcilePatch` currently applies to the main resource only; status-subresource SSA on resources you don't own is not yet supported.
 - **Conditional watches**: only start informers for GVKs when a feature is enabled in the CR, reducing memory/API load for optional components
 - **Dry-run mode**: return the planned mutations without applying, useful for debugging, testing, and CI validation
 - **Metrics and tracing**: OpenTelemetry integration per sub-reconciler — latency, re-run count, apply count, dependency graph size
 - **Dependency graph visualization**: auto-generate mermaid diagrams from the tracker at runtime, exposable via a debug endpoint
-- **Finalizer management**: framework-managed finalizers for cleanup of external resources on primary deletion
 - **Health/readiness integration**: expose sub-reconciler health as a manager health signal, surfaceable via standard health endpoints
 - **Rate limiting and backoff**: per sub-reconciler rate limiting on re-runs to prevent thundering herds
 - **Diff reporting**: surface what changed between desired and actual state for debugging, e.g. via structured logging or events
