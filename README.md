@@ -157,6 +157,8 @@ mr.ReconcilePatch(mgr, apps, gateways, func(hc *mr.HandlerContext, app *MyApp) *
 
 The callback receives a `HandlerContext` so it can `Fetch` resources needed for cleanup. Return `nil` to indicate success (finalizer removed). Return an error to retry on the next event (finalizer stays).
 
+Only one `OnDelete` registration is allowed per primary GVK. Calling `OnDelete` again for the same primary type replaces the previous callback.
+
 ```go
 mr.OnDelete(mgr, platforms, func(hc *mr.HandlerContext, p *Platform) error {
     vs := mr.Fetch(hc, virtualServices, mr.FilterName(p.Name+"-vs", p.Namespace))
@@ -247,9 +249,9 @@ mgr, err := mr.NewManager(cfg, scheme,
 )
 
 // Watch a resource type, optionally with predicates.
-col := mr.Watch[*corev1.Pod](mgr)
-col := mr.Watch[*MyApp](mgr, mr.WithGenerationChanged())
-col := mr.Watch[*corev1.ConfigMap](mgr, mr.WithEventPredicate(mr.EventPredicate{
+pods := mr.Watch[*corev1.Pod](mgr)
+apps := mr.Watch[*MyApp](mgr, mr.WithGenerationChanged())
+configMaps := mr.Watch[*corev1.ConfigMap](mgr, mr.WithEventPredicate(mr.EventPredicate{
     Update: func(old, new client.Object) bool { return old.GetResourceVersion() != new.GetResourceVersion() },
 }))
 
@@ -292,6 +294,7 @@ mgr.Start(ctx)
 
 These are tracked directions for the project. Contributions welcome.
 
+- **Foreign resource status** (e.g. Gateway API policy attachment): write status entries to foreign resources via `c.Status().Patch(...)` with field-manager-scoped SSA. `ReconcilePatch` currently applies to the main resource only; status-subresource SSA on resources you don't own is not yet supported.
 - **Conditional watches**: only start informers for GVKs when a feature is enabled in the CR, reducing memory/API load for optional components
 - **Dry-run mode**: return the planned mutations without applying, useful for debugging, testing, and CI validation
 - **Metrics and tracing**: OpenTelemetry integration per sub-reconciler — latency, re-run count, apply count, dependency graph size
