@@ -94,9 +94,11 @@ func (s *annotationStrategy) prepareDesired(ctx context.Context, c client.Client
 		case isNotFound(getErr):
 			// Object doesn't exist yet — fall through to sole contributor.
 		default:
-			// Transient error (timeout, network). Don't overwrite the annotation
-			// with a single contributor — leave it unset so the apply either
-			// fails or preserves whatever is on the server.
+		// Transient error — return without setting the annotation. SSA may strip
+		// the annotation from the server since it's absent from the apply
+		// configuration. This is safe: subsequent reconciles by any contributor
+		// will re-add their entries. Under-tracking is conservative (prevents
+		// premature deletion, not causes it).
 			return
 		}
 	}
