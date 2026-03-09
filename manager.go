@@ -409,7 +409,9 @@ func (h *eventHandler) handle(obj client.Object) {
 	ctx := context.Background()
 
 	// If this event is for a primary resource that is being deleted and has
-	// a cleanup function registered, run cleanup and skip normal reconciliation.
+	// a cleanup function registered, run cleanup and skip the primary's own
+	// reconcilers. The dependency notification path still runs so that other
+	// reconcilers watching this resource as a dependency are notified.
 	isPrimaryForAnyReconciler := false
 	for _, r := range h.mgr.reconcilers {
 		if r.PrimaryGVK() == h.gvk {
@@ -434,11 +436,12 @@ func (h *eventHandler) handle(obj client.Object) {
 		}
 	}
 
+	primaryDeleting := false
 	if isPrimaryForAnyReconciler && h.mgr.needsFinalizer(h.gvk) {
 		primary := h.mgr.getPrimary(ctx, h.gvk, nn)
 		if primary != nil && primary.GetDeletionTimestamp() != nil {
 			h.mgr.runCleanup(ctx, h.gvk, nn, primary)
-			return
+			primaryDeleting = true
 		}
 	}
 
@@ -456,7 +459,7 @@ func (h *eventHandler) handle(obj client.Object) {
 
 	// Is this a primary resource for any output reconciler?
 	for _, r := range h.mgr.reconcilers {
-		if r.PrimaryGVK() == h.gvk {
+		if r.PrimaryGVK() == h.gvk && !primaryDeleting {
 			h.mgr.runSubReconciler(ctx, r, nn)
 			recordAffected(r.PrimaryGVK(), nn)
 		}
@@ -477,7 +480,7 @@ func (h *eventHandler) handle(obj client.Object) {
 	// Phase 1b: run patch reconcilers.
 
 	for _, pr := range h.mgr.patchReconcilers {
-		if pr.PrimaryGVK() == h.gvk {
+		if pr.PrimaryGVK() == h.gvk && !primaryDeleting {
 			h.mgr.runPatchReconciler(ctx, pr, nn)
 			recordAffected(pr.PrimaryGVK(), nn)
 		}
@@ -498,7 +501,7 @@ func (h *eventHandler) handle(obj client.Object) {
 
 	// Is this a primary resource for any status reconciler?
 	for _, sr := range h.mgr.statusReconcilers {
-		if sr.PrimaryGVK() == h.gvk {
+		if sr.PrimaryGVK() == h.gvk && !primaryDeleting {
 			recordAffected(sr.PrimaryGVK(), nn)
 		}
 	}
